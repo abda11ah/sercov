@@ -145,7 +145,7 @@ When the VM disconnects, the parent detects the PTY closure and automatically re
 ### Terminal Access
 For direct interaction outside of the MCP environment, you can connect to the Unix socket:
 ```bash
-socat - UNIX-CONNECT:/tmp/serial_BEEMO_VM
+socat - UNIX-CONNECT:/tmp/serial_VMNAME
 ```
 New connections automatically receive the last 50 lines of history.
 
