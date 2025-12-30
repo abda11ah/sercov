@@ -94,7 +94,7 @@ Executes a specific tool.
 ### 1. `start`
 Starts the bridge for a specific VM. If a bridge already exists, it is restarted to ensure a **clean slate**.
 - **Arguments**: `{"VM_NAME": "string", "PORT": "number"}` (PORT is optional, default: 4555)
-- **Example**: `tools/call {"name": "start", "arguments": {"VM_NAME": "BEEMO_VM", "PORT": 4555}}`
+- **Example**: `tools/call {"name": "start", "arguments": {"VM_NAME": "MYVM", "PORT": 4555}}`
 
 ### 2. `status`
 Checks the status of the bridge.
@@ -145,7 +145,7 @@ When the VM disconnects, the parent detects the PTY closure and automatically re
 ### Terminal Access
 For direct interaction outside of the MCP environment, you can connect to the Unix socket:
 ```bash
-socat - UNIX-CONNECT:/tmp/serial_VMNAME
+socat - UNIX-CONNECT:/tmp/serial_MYVM
 ```
 New connections automatically receive the last 50 lines of history.
 
