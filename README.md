@@ -20,7 +20,8 @@ It uses `IO::Pty` to create a pseudo-terminal (PTY) for the VM serial console. I
 - Perl with `IO::Pty` and `JSON::PP` modules installed.
 - VM running with serial console on a TCP port (default starts at 4555).
 - It does not require root permissions.
-- It does not require having socat/minicom installed (these are optional).
+- It does not require root permissions.
+- **Automatic Terminal Feature**: Requires a supported terminal emulator (e.g., konsole, gnome-terminal, xterm, etc.) to automatically spawn a window. It uses an internal client mode and does **not** require `socat`.
 
 ## Configuration
 
@@ -93,6 +94,7 @@ Executes a specific tool.
 
 ### 1. `start`
 Starts the bridge for a specific VM. If a bridge already exists, it is restarted to ensure a **clean slate**.
+**New behavior**: Automatically spawns a graphical terminal window linked to the session using the internal client of `sercov.pl`.
 - **Arguments**: `{"VM_NAME": "string", "PORT": "number"}` (PORT is optional, default: 4555)
 - **Example**: `tools/call {"name": "start", "arguments": {"VM_NAME": "MYVM", "PORT": 4555}}`
 
@@ -143,9 +145,9 @@ The parent MCP server uses `IO::Select` to multiplex:
 When the VM disconnects, the parent detects the PTY closure and automatically restarts the bridge child to maintain persistence.
 
 ### Terminal Access
-For direct interaction outside of the MCP environment, you can connect to the Unix socket:
+For direct interaction outside of the MCP environment, you can use the script itself as a client:
 ```bash
-socat - UNIX-CONNECT:/tmp/serial_MYVM
+./sercov.pl --client /tmp/serial_MYVM
 ```
 New connections automatically receive the last 50 lines of history.
 
