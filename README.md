@@ -21,7 +21,33 @@ It uses `IO::Pty` to create a pseudo-terminal (PTY) for the VM serial console. I
 - VM running with serial console on a TCP port (default starts at 4555).
 - It does not require root permissions.
 - It does not require root permissions.
-- **Automatic Terminal Feature**: Requires a supported terminal emulator (e.g., konsole, gnome-terminal, xterm, etc.) to automatically spawn a window. It uses an internal client mode and does **not** require `socat`.
+- **Automatic Terminal Feature**: Requires a supported terminal emulator to automatically spawn a window. It uses an internal client mode and does **not** require `socat`.
+
+### Supported Terminal Emulators
+
+The script automatically detects and supports the following terminal emulators:
+
+**Linux/Unix:**
+- `konsole` (KDE)
+- `gnome-terminal` (GNOME)
+- `xterm` (classic X11 terminal)
+- `terminator` (advanced tiling terminal)
+- `tilix` (GTK3 tiling terminal)
+- `alacritty` (GPU-accelerated terminal)
+- `kitty` (GPU-accelerated terminal)
+- `urxvt` (Unicode rxvt)
+- `xfce4-terminal` (XFCE desktop)
+- `lxterminal` (LXDE desktop)
+- `deepin-terminal` (Deepin desktop)
+- `mate-terminal` (MATE desktop)
+- `qterminal` (LXQt desktop)
+- `wezterm` (cross-platform terminal)
+
+**macOS:**
+- `Terminal.app` (built-in macOS terminal)
+- `iTerm.app` (iTerm2)
+
+The script will automatically detect which terminal is available on your system and use the appropriate command-line arguments to spawn a new terminal window connected to the VM serial console session.
 
 ## Configuration
 
@@ -127,6 +153,7 @@ graph TD
     Client["MCP Client (LLM / Opencode)"]
     UnixSocket["Unix Socket (/tmp/serial_VM_NAME)"]
     TermClients["Terminal Clients (socat / minicom)"]
+    ScriptClient["sercov.pl --socket=/tmp/serial_VM_NAME"]
 
     VM <--> Bridge
     Bridge <--> PTY
@@ -134,6 +161,7 @@ graph TD
     MCP <--> Client
     MCP <--> UnixSocket
     UnixSocket <--> TermClients
+    UnixSocket <--> ScriptClient
 ```
 
 The parent MCP server uses `IO::Select` to multiplex:
@@ -147,7 +175,7 @@ When the VM disconnects, the parent detects the PTY closure and automatically re
 ### Terminal Access
 For direct interaction outside of the MCP environment, you can use the script itself as a client:
 ```bash
-./sercov.pl --client /tmp/serial_MYVM
+./sercov.pl --socket=/tmp/serial_MYVM
 ```
 New connections automatically receive the last 50 lines of history.
 

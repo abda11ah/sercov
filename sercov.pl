@@ -10,11 +10,15 @@ use IO::Select;
 use POSIX qw(strftime WNOHANG);
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 use IPC::Cmd qw(can_run);
+use Getopt::Long;
+our %options;
+GetOptions(
+	\%options,
+	'socket=s',
+);
 # --- Internal Unix-socket client mode ---
-# If invoked as: script.pl --client /path/to/socket
-# it runs as a simple Unix socket client (used by spawned terminals)
-if (@ARGV && $ARGV[0] eq '--client') {
-	my $socket_path = $ARGV[1];
+if ($options{'socket'}) {
+	my $socket_path = $options{'socket'};
 	if (!$socket_path) {
 		print STDERR "Missing socket path\n";
 		exit 1;
@@ -49,7 +53,6 @@ use constant {
 };
 # Global state
 my %bridges;   # VM_NAME => { pty => $pty, socket => $socket, port => $port, buffer => \@buffer, select => $select }
-my %vm_ports;  # VM_NAME => port
 my $running = 1;
 # Debug output function
 sub debug {
@@ -203,7 +206,6 @@ sub handle_request {
 	if ($method eq 'tools/list') {
 		my @list = map { { name => $_, %{ $TOOLS{$_} } } } keys %TOOLS;
 		for (@list) { delete $_->{handler} }    # Don't send handler in list
-		for (@list) { delete $_->{handler} }
 		return {jsonrpc => "2.0",id      => $id,result  => { tools => \@list }};
 	}
 	if ($method eq 'tools/call') {
@@ -254,7 +256,7 @@ sub tool_serial_status {
 	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_INVALID_PARAMS,message => "VM_NAME parameter is required"}} unless $vm_name;
 	return do {
 		if (bridge_exists($vm_name)) {
-			{running     => 1,vm_name     => $vm_name,port        => $vm_ports{$vm_name},buffer_size => scalar(@{ $bridges{$vm_name}->{buffer} })};
+			{running     => 1,vm_name     => $vm_name,port        => $bridges{$vm_name}{port},buffer_size => scalar(@{ $bridges{$vm_name}->{buffer} })};
 		}else {
 			{running     => 0,vm_name     => $vm_name,port        => undef,buffer_size => 0};
 		}
@@ -312,7 +314,6 @@ sub bridge_exists {
 sub start_bridge {
 	my ($vm_name, $port) = @_;
 	$port = $DEFAULT_VM_PORT unless defined $port;
-	$vm_ports{$vm_name} = $port;
 	debug("Creating bridge for $vm_name on port $port");
 	# Create PTY
 	my $pty = IO::Pty->new();
@@ -406,13 +407,23 @@ sub start_bridge {
 		# Generate Session ID
 		my $session_id = sprintf("session_%s_%d", $vm_name, time());
 		# Store bridge info
-		$bridges{$vm_name} = {pty       => $pty,socket    => $socket,port      => $port,buffer    => [],pid       => $pid,clients   => {},session_id => $session_id};
+		$bridges{$vm_name} = {
+			pty     => $pty,
+			socket  => $socket,
+			port    => $port,
+			buffer  => [],
+			pid     => $pid,
+			session => {
+				id      => $session_id,
+				clients => {},
+			}
+		};
 		# Register PTY and Unix socket in main select loop
 		$mcp_select->add($pty);
 		$mcp_select->add($socket);
 		# Spawn terminal window linked to this session
 		spawn_terminal_client($vm_name, $socket_path);
-		return {success    => 1,message    => "Bridge started for VM: $vm_name",port       => $port,socket     => $socket_path,session_id => $session_id};
+		return {success => 1,message => "Bridge started for VM: $vm_name",port => $port,socket => $socket_path,session_id => $session_id};
 	}else {
 		debug("Parent process: Bridge setup failed - cleaning up");
 		# Clean up on failure
@@ -531,7 +542,6 @@ sub stop_bridge {
 	unlink $socket_path if -e $socket_path;
 	# Clean up
 	delete $bridges{$vm_name};
-	delete $vm_ports{$vm_name};
 }
 # Monitor bridge for PTY and Unix socket communication (single filehandle processing)
 sub monitor_bridge {
@@ -553,9 +563,9 @@ sub monitor_bridge {
 				shift @{ $bridge->{buffer} }while @{ $bridge->{buffer} } > $RING_BUFFER_SIZE;
 			}
 			# Forward to all connected terminal window clients
-			my $client_count = scalar keys %{ $bridge->{clients} };
+			my $client_count = scalar keys %{ $bridge->{session}->{clients} };
 			debug("Monitor: Forwarding to $client_count clients");
-			for my $client (values %{ $bridge->{clients} }) {
+			for my $client (values %{ $bridge->{session}->{clients} }) {
 				eval { syswrite($client, $buffer); };
 				next if $!{EINTR} || $!{EAGAIN};
 			}
@@ -570,7 +580,7 @@ sub monitor_bridge {
 		my $client = $bridge->{socket}->accept();
 		if ($client) {
 			my $client_id = fileno($client);
-			$bridge->{clients}->{$client_id} = $client;
+			$bridge->{session}->{clients}->{$client_id} = $client;
 			$mcp_select->add($client);
 			debug("Monitor: New client connected with ID $client_id");
 			# Send current buffer content to new client
@@ -585,7 +595,7 @@ sub monitor_bridge {
 				next if $!{EINTR} || $!{EAGAIN};
 			}
 		}
-	}elsif (exists $bridge->{clients}->{ fileno($fh) }) {
+	}elsif (exists $bridge->{session}->{clients}->{ fileno($fh) }) {
 		# Data from terminal window client → VM via PTY master
 		my $buffer;
 		my $bytes = sysread($fh, $buffer, 4096);
@@ -599,7 +609,7 @@ sub monitor_bridge {
 			my $client_id = fileno($fh);
 			debug("Monitor: Client $client_id disconnected");
 			$mcp_select->remove($fh);
-			delete $bridge->{clients}->{$client_id};
+			delete $bridge->{session}->{clients}->{$client_id};
 			close $fh;
 		}
 	}
@@ -649,20 +659,6 @@ sub detect_terminal {
 	}
 	return; # Return undef if no terminal found
 }
-sub build_terminal_cmd {
-	my ($terminal, $cmd) = @_;
-	my ($bin, $prefix) = @$terminal;
-	if ($bin eq 'terminal-macos' || $bin eq 'iterm-macos') {
-		return $prefix->($cmd);
-	}
-	if (ref $prefix eq 'CODE') {
-		return $prefix->($cmd);
-	}elsif ($prefix eq '-- bash -c') {
-		return qq{$bin -- bash -c "$cmd; exec bash"};
-	}else {
-		return qq{$bin $prefix "$cmd"};
-	}
-}
 sub spawn_terminal_client {
 	my ($vm_name, $socket_path) = @_;
 	debug("Attempting to spawn terminal for VM: $vm_name");
@@ -673,8 +669,20 @@ sub spawn_terminal_client {
 			return;
 		}
 		# Relaunch this script in internal client mode
-		my $cmd = "$^X $0 --client $socket_path";
-		my $full_cmd = build_terminal_cmd($term, $cmd);
+		my $cmd = "$^X $0 --socket=$socket_path";
+		my $full_cmd = do {
+			my ($terminal, $cmd) = ($term, $cmd);
+			my ($bin, $prefix) = @$terminal;
+			if ($bin eq 'terminal-macos' || $bin eq 'iterm-macos') {
+				$prefix->($cmd);
+			}elsif (ref $prefix eq 'CODE') {
+				$prefix->($cmd);
+			}elsif ($prefix eq '-- bash -c') {
+				qq{$bin -- bash -c "$cmd; exec bash"};
+			}else {
+				qq{$bin $prefix "$cmd"};
+			}
+		};
 		debug("Spawning terminal command: $full_cmd");
 		# Fork and exec to detach
 		my $pid = fork();
