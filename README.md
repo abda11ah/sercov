@@ -221,6 +221,7 @@ When the VM disconnects, the parent detects the PTY closure and automatically re
 
 ## Sequence Diagram
 
+```mermaid
 sequenceDiagram
 autonumber
 participant VM as VM (serial console)
@@ -256,6 +257,7 @@ MCP-->>PTY: Write into PTY master
 PTY-->>Bridge: Data read from PTY slave
 Bridge-->>TCP: Write to TCP socket
 TCP-->>VM: Command received on the serial console
+```
 
 ### Terminal Access
 For direct interaction outside of the MCP environment, you can use the script itself as a client:
