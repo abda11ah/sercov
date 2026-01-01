@@ -52,7 +52,7 @@ use constant {
 	MCP_UNSUPPORTED_FORMAT    => -32012,
 };
 # Global state
-my %bridges;   # VM_NAME => { pty => $pty, socket => $socket, port => $port, buffer => \@buffer, select => $select }
+my %bridges;
 my $running = 1;
 # Debug output function
 sub debug {
@@ -155,32 +155,32 @@ my %TOOLS = (
 		description => "Start the bridge for VM serial console communication.",
 		inputSchema => {
 			type       => "object",
-			properties => {VM_NAME => {type        => "string",description => "Name of the VM"},PORT => {type        => "string",description => "Port number for VM serial console (default: 4555)"}},
-			required => ["VM_NAME"]
+			properties => {vm_name => {type        => "string",description => "Name of the VM"},port => {type        => "string",description => "Port number for VM serial console (default: 4555)"}},
+			required => ["vm_name"]
 		},
 		handler => \&tool_serial_start
 	},
 	stop => {
 		description => "Stop the bridge.",
-		inputSchema => {type       => "object",properties => {VM_NAME => {type        => "string",description => "Name of the VM"}},required => ["VM_NAME"]},
+		inputSchema => {type       => "object",properties => {vm_name => {type        => "string",description => "Name of the VM"}},required => ["vm_name"]},
 		handler => \&tool_serial_stop
 	},
 	status => {
 		description => "Check the status of the bridge.",
-		inputSchema => {type       => "object",properties => {VM_NAME => {type        => "string",description => "Name of the VM"}},required => ["VM_NAME"]},
+		inputSchema => {type       => "object",properties => {vm_name => {type        => "string",description => "Name of the VM"}},required => ["vm_name"]},
 		handler => \&tool_serial_status
 	},
 	read => {
 		description => "Read output from VM serial console (20s timeout).",
-		inputSchema => {type       => "object",properties => {VM_NAME => {type        => "string",description => "Name of the VM"}},required => ["VM_NAME"]},
+		inputSchema => {type       => "object",properties => {vm_name => {type        => "string",description => "Name of the VM"}},required => ["vm_name"]},
 		handler => \&tool_serial_read
 	},
 	write => {
 		description => "Send a command to the VM serial console.",
 		inputSchema => {
 			type       => "object",
-			properties => {VM_NAME => {type        => "string",description => "Name of the VM"},text => {type        => "string",description => "Command to send to the VM"}},
-			required => [ "VM_NAME", "text" ]
+			properties => {vm_name => {type        => "string",description => "Name of the VM"},text => {type        => "string",description => "Command to send to the VM"}},
+			required => [ "vm_name", "text" ]
 		},
 		handler => \&tool_serial_write
 	}
@@ -228,21 +228,25 @@ sub handle_request {
 # Tool: Start VM serial bridge
 sub tool_serial_start {
 	my ($params) = @_;
-	my $vm_name  = $params->{VM_NAME} || $params->{vm_name};
-	my $port     = $params->{PORT}    || $params->{port} || $DEFAULT_VM_PORT;
+	# Normalize parameter keys to lowercase
+	$params = { map { lc($_) => $params->{$_} } keys %$params };
+	my $vm_name  = $params->{vm_name};
+	my $port     = $params->{port} || $DEFAULT_VM_PORT;
 	debug("Starting bridge for VM: $vm_name on port: $port");
-	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_INVALID_PARAMS,message => "VM_NAME parameter is required"}} unless $vm_name;
+	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_INVALID_PARAMS,message => "vm_name parameter is required"}} unless $vm_name;
 	if (bridge_exists($vm_name)) {
 		debug("Stopping existing bridge for VM: $vm_name (fresh slate)");
-		tool_serial_stop({ VM_NAME => $vm_name });
+		tool_serial_stop({ vm_name => $vm_name });
 	}
 	return start_bridge($vm_name, $port);
 }
 # Tool: Stop VM serial bridge
 sub tool_serial_stop {
 	my ($params) = @_;
-	my $vm_name  = $params->{VM_NAME} || $params->{vm_name};
-	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_INVALID_PARAMS,message => "VM_NAME parameter is required"}} unless $vm_name;
+	# Normalize parameter keys to lowercase
+	$params = { map { lc($_) => $params->{$_} } keys %$params };
+	my $vm_name  = $params->{vm_name};
+	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_INVALID_PARAMS,message => "vm_name parameter is required"}} unless $vm_name;
 	if (!bridge_exists($vm_name)) {
 		return {success => 0,message => "No bridge running for VM: $vm_name"};
 	}
@@ -252,8 +256,10 @@ sub tool_serial_stop {
 # Tool: Check VM serial bridge status
 sub tool_serial_status {
 	my ($params) = @_;
-	my $vm_name  = $params->{VM_NAME} || $params->{vm_name};
-	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_INVALID_PARAMS,message => "VM_NAME parameter is required"}} unless $vm_name;
+	# Normalize parameter keys to lowercase
+	$params = { map { lc($_) => $params->{$_} } keys %$params };
+	my $vm_name  = $params->{vm_name};
+	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_INVALID_PARAMS,message => "vm_name parameter is required"}} unless $vm_name;
 	return do {
 		if (bridge_exists($vm_name)) {
 			{running     => 1,vm_name     => $vm_name,port        => $bridges{$vm_name}{port},buffer_size => scalar(@{ $bridges{$vm_name}->{buffer} })};
@@ -265,9 +271,11 @@ sub tool_serial_status {
 # Tool: Read from VM serial console
 sub tool_serial_read {
 	my ($params) = @_;
-	my $vm_name  = $params->{VM_NAME} || $params->{vm_name};
+	# Normalize parameter keys to lowercase
+	$params = { map { lc($_) => $params->{$_} } keys %$params };
+	my $vm_name  = $params->{vm_name};
 	debug("Read request for VM: $vm_name");
-	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_INVALID_PARAMS,message => "VM_NAME parameter is required"}} unless $vm_name;
+	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_INVALID_PARAMS,message => "vm_name parameter is required"}} unless $vm_name;
 	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_RESOURCE_NOT_FOUND,message => "Bridge not running for VM: $vm_name. Use start to start it."}} unless bridge_exists($vm_name);
 	return do {
 		my $bridge = $bridges{$vm_name};
@@ -285,10 +293,12 @@ sub tool_serial_read {
 # Tool: Write to VM serial console
 sub tool_serial_write {
 	my ($params) = @_;
-	my $vm_name  = $params->{VM_NAME} || $params->{vm_name};
+	# Normalize parameter keys to lowercase
+	$params = { map { lc($_) => $params->{$_} } keys %$params };
+	my $vm_name  = $params->{vm_name};
 	my $text     = $params->{text};
 	debug("Write request for VM: $vm_name with text: '$text'");
-	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_INVALID_PARAMS,message => "VM_NAME and text parameters are required"}} unless $vm_name && defined $text;
+	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_INVALID_PARAMS,message => "vm_name and text parameters are required"}} unless $vm_name && defined $text;
 	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_RESOURCE_NOT_FOUND,message => "Bridge not running for VM: $vm_name. Use start to start it."}} unless bridge_exists($vm_name);
 	my $result = do {
 		my $bridge = $bridges{$vm_name};
