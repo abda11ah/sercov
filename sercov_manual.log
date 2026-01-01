@@ -1,0 +1,9 @@
+=== Manual Test for sercov.pl ===
+Test started at: jeu. 01 janv. 2026 14:17:41 CET
+================================
+Starting mock VM server...
+Mock VM server started with PID: 5963
+Running manual test...
+Stopping processes...
+Test completed at: jeu. 01 janv. 2026 14:17:59 CET
+================================

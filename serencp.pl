@@ -7,15 +7,12 @@ use JSON::PP qw(decode_json encode_json);
 use IO::Socket::UNIX;
 use IO::Pty;
 use IO::Select;
-use POSIX qw(strftime WNOHANG);
+use POSIX qw(strftime WNOHANG setsid);
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 use IPC::Cmd qw(can_run);
 use Getopt::Long;
 our %options;
-GetOptions(
-	\%options,
-	'socket=s',
-);
+GetOptions(\%options,'socket=s',);
 # --- Internal Unix-socket client mode ---
 if ($options{'socket'}) {
 	my $socket_path = $options{'socket'};
@@ -64,16 +61,7 @@ sub debug {
 # Send VM output notification
 sub send_vm_output_notification {
 	my ($vm_name, $stream, $chunk) = @_;
-	my $notification = {
-		jsonrpc => "2.0",
-		method => "notifications/vm_output",
-		params => {
-			vm => $vm_name,
-			stream => $stream,
-			chunk => $chunk,
-			timestamp => strftime("%Y-%m-%dT%H:%M:%S.000Z", gmtime)
-		}
-	};
+	my $notification = {jsonrpc => "2.0",method => "notifications/vm_output",params => {vm => $vm_name,stream => $stream,chunk => $chunk,timestamp => strftime("%Y-%m-%dT%H:%M:%S.000Z", gmtime)}};
 	my $notification_json = encode_json($notification);
 	print STDOUT $notification_json . "\n";
 	debug("Sent VM output notification for $vm_name ($stream): " . length($chunk) . " bytes");
@@ -434,17 +422,7 @@ sub start_bridge {
 		# Generate Session ID
 		my $session_id = sprintf("session_%s_%d", $vm_name, time());
 		# Store bridge info
-		$bridges{$vm_name} = {
-			pty     => $pty,
-			socket  => $socket,
-			port    => $port,
-			buffer  => [],
-			pid     => $pid,
-			session => {
-				id      => $session_id,
-				clients => {},
-			}
-		};
+		$bridges{$vm_name} = {pty     => $pty,socket  => $socket,port    => $port,buffer  => [],pid     => $pid,session => {id      => $session_id,clients => {},}};
 		# Register PTY and Unix socket in main select loop
 		$mcp_select->add($pty);
 		$mcp_select->add($socket);
@@ -663,7 +641,7 @@ sub detect_terminal {
 	}
 	my %terminals = (
 		konsole    => [ 'konsole',        '-e' ],
-		gnome      => [ 'gnome-terminal', '-- bash -c' ],
+		gnome      => [ 'gnome-terminal', '-- sh -c' ],
 		xterm      => [ 'xterm',          '-e' ],
 		terminator => [ 'terminator',     '-e' ],
 		tilix      => [ 'tilix',          '-e' ],
@@ -692,17 +670,32 @@ sub spawn_terminal_client {
 			debug("No terminal detected");
 			return;
 		}
+		# Detect current shell for universal compatibility
+		my $shell = do {
+			my $detected_shell = $ENV{SHELL} || '/bin/sh';
+			# Ensure it's a valid POSIX shell path
+			if (-x $detected_shell) {
+				$detected_shell;
+			} else {
+				'/bin/sh'; # Fallback to sh
+			}
+		};
+		my $shell_name = (split '/', $shell)[-1]; # Get shell basename (e.g., 'zsh', 'bash')
 		# Relaunch this script in internal client mode
 		my $cmd = "$^X $0 --socket=$socket_path";
 		my $full_cmd = do {
 			my ($terminal, $cmd) = ($term, $cmd);
 			my ($bin, $prefix) = @$terminal;
+			# Adapt shell-specific prefixes to use detected shell
+			if ($prefix eq '-- sh -c') {
+				$prefix = "-- $shell_name -c";
+			}
 			if ($bin eq 'terminal-macos' || $bin eq 'iterm-macos') {
 				$prefix->($cmd);
 			}elsif (ref $prefix eq 'CODE') {
 				$prefix->($cmd);
-			}elsif ($prefix eq '-- bash -c') {
-				qq{$bin -- bash -c "$cmd; exec bash"};
+			}elsif ($prefix =~ /-- \S+ -c$/) {
+				qq{$bin $prefix "$cmd; exec $shell_name"};
 			}else {
 				qq{$bin $prefix "$cmd"};
 			}

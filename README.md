@@ -1,10 +1,10 @@
-# SERCOV - The SERial COnsole to Vm MCP Server Usage Guide
+# SERENCP - The SERial COnsole to Vm MCP Server Usage Guide
 
 (tested with QEMU/KVM/virt-manager and OpenCode)
 
 ## Overview
 
-The `sercov.pl` script provides a standard MCP (Model Context Protocol) 1.0 server for bidirectional communication with VM serial consoles via an internal Perl-based socket bridge.
+The `serencp.pl` script provides a standard MCP (Model Context Protocol) 1.0 server for bidirectional communication with VM serial consoles via an internal Perl-based socket bridge.
 
 It uses `IO::Pty` to create a pseudo-terminal (PTY) for the VM serial console. It manages multiple VMs by assigning unique TCP ports for communication and provides a high-performance multiplexed event loop.
 
@@ -53,9 +53,9 @@ The script will automatically detect which terminal is available on your system 
 Make sure the MCP server is configured in `opencode.jsonc`:
 ```json
 "mcp": {
-    "sercov": {
+    "serencp": {
         "type": "local",
-        "command": ["perl", "/path/to/sercov.pl"],
+        "command": ["perl", "/path/to/serencp.pl"],
         "enabled": true
     }
 }
@@ -164,7 +164,7 @@ client.on('notification', (notification) => {
 
 ### 1. `start`
 Starts the bridge for a specific VM. If a bridge already exists, it is restarted to ensure a **clean slate**.
-**New behavior**: Automatically spawns a graphical terminal window linked to the session using the internal client of `sercov.pl`.
+**New behavior**: Automatically spawns a graphical terminal window linked to the session using the internal client of `serencp.pl`.
 - **Arguments**: `{"vm_name": "string", "port": "number"}` (port is optional, default: 4555)
 - **Returns**: `{"success": true, "message": "...", "port": 4555, "socket": "/tmp/...", "session_id": "session_..."}`
 - **Example**: `tools/call {"name": "start", "arguments": {"vm_name": "MYVM", "port": 4555}}`
@@ -194,11 +194,12 @@ graph TD
     VM["VM Serial Console (TCP:127.0.0.1:4555+)"]
     Bridge["Perl Bridge Child (Forked)"]
     PTY["Pseudo-Terminal (PTY Master)"]
-    MCP["sercov MCP Server (Main Event Loop)"]
+    MCP["serencp MCP Server (Main Event Loop)"]
     Client["MCP Client (LLM / Opencode)"]
     UnixSocket["Unix Socket (/tmp/serial_VM_NAME)"]
-    ScriptClient["sercov.pl --socket=/tmp/serial_VM_NAME"]
+    ScriptClient["serencp.pl --socket=/tmp/serial_VM_NAME"]
     ExtClients["External Clients (optional)"]
+    LiveTerminal["Live Terminal View (Auto-Spawned)"]
 
     VM <--> Bridge
     Bridge <--> PTY
@@ -206,6 +207,7 @@ graph TD
     MCP <--> Client
     MCP <--> UnixSocket
     UnixSocket <--> ScriptClient
+    UnixSocket <--> LiveTerminal
     UnixSocket -.-> ExtClients
 ```
 
@@ -220,7 +222,7 @@ When the VM disconnects, the parent detects the PTY closure and automatically re
 ### Terminal Access
 For direct interaction outside of the MCP environment, you can use the script itself as a client:
 ```bash
-./sercov.pl --socket=/tmp/serial_MYVM
+./serencp.pl --socket=/tmp/serial_MYVM
 ```
 New connections automatically receive the last 50 lines of history. Live output notifications are sent automatically when VM data is received, providing real-time streaming without polling.
 
@@ -229,7 +231,7 @@ New connections automatically receive the last 50 lines of history. Live output 
 - **Bridge not running**: Call `start` before attempting to read or write.
 - **No live notifications**: Ensure your MCP client supports notification handling. Notifications are sent automatically when VM output is received.
 - **Socket Permission**: Ensure `/tmp` is writable by the user running the MCP server.
-- **Syntax Check**: Run `perl -c sercov.pl` to verify script integrity.
+- **Syntax Check**: Run `perl -c serencp.pl` to verify script integrity.
 
 ## Testing
 
