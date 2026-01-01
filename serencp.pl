@@ -24,9 +24,9 @@ if ($options{'socket'}) {
 	exit 0;
 }
 # Configuration
-my $DEFAULT_VM_PORT   = 4555;
-my $RING_BUFFER_SIZE  = 1000;
-my $DEBUG             = 1;  # Enable debug output
+our $DEFAULT_VM_PORT   = 4555;
+our $RING_BUFFER_SIZE  = 1000;
+our $DEBUG             = 1;  # Enable debug output
 # Simplified defaults for LLM use
 # MCP Error Constants
 use constant {
@@ -49,8 +49,45 @@ use constant {
 	MCP_UNSUPPORTED_FORMAT    => -32012,
 };
 # Global state
-my %bridges;
-my $running = 1;
+our %bridges;
+our $running = 1;
+# Main MCP select - handles only STDIN for JSON-RPC requests
+my $mcp_select = IO::Select->new(\*STDIN);
+# Terminal detection and spawning helpers
+our $term = do {
+	# macOS Terminal.app detection - early return for efficiency
+	if ($^O eq 'darwin') {
+		return ['terminal-macos', sub { "open -a Terminal \"$_[0]\"" }]
+			if -d "/Applications/Terminal.app";
+		return ['iterm-macos', sub { "open -a iTerm \"$_[0]\"" }]
+			if -d "/Applications/iTerm.app";
+	}
+	# Define terminals in order of preference for better selection
+	my @terminals = (
+		[konsole    => [ 'konsole',        '-e' ]],
+		[gnome      => [ 'gnome-terminal', '-- sh -c' ]],
+		[xterm      => [ 'xterm',          '-e' ]],
+		[terminator => [ 'terminator',     '-e' ]],
+		[guake      => [ 'guake',          '-e' ]],
+		[tilix      => [ 'tilix',          '-e' ]],
+		[alacritty  => [ 'alacritty',      '-e' ]],
+		[kitty      => [ 'kitty',          sub { "kitty $_[0]" } ]],
+		[urxvt      => [ 'urxvt',          '-e' ]],
+		[xfce4      => [ 'xfce4-terminal', '--command' ]],
+		[lxterminal => [ 'lxterminal',     '--command' ]],
+		[deepin     => [ 'deepin-terminal','-x' ]],
+		[mate       => [ 'mate-terminal',  '--command' ]],
+		[qterminal  => [ 'qterminal',      '-e' ]],
+		[wezterm    => [ 'wezterm',        sub { "wezterm start -- $_[0]" } ]],
+		[ghostty    => [ 'ghostty',        '-e' ]],
+	);
+	# Return first available terminal - optimized loop
+	for my $terminal (@terminals) {
+		my ($name, $config) = @$terminal;
+		return $config if can_run($config->[0]);
+	}
+	undef; # Explicit undef return for clarity
+};
 # Debug output function
 sub debug {
 	my ($message) = @_;
@@ -76,8 +113,6 @@ sub _error {
 	}
 	return encode_json($error_response);
 }
-# Main select for MCP server and PTYs
-my $mcp_select = IO::Select->new(\*STDIN);
 # Start the MCP server
 sub start_mcp_server {
 	local $SIG{INT}  = \&cleanup;
@@ -104,8 +139,9 @@ sub start_mcp_server {
 		};
 	debug("Starting VM Serial MCP Server...");
 	while ($running) {
-		my @ready = $mcp_select->can_read(1);
-		for my $fh (@ready) {
+		# Handle MCP requests from STDIN (main select)
+		my @mcp_ready = $mcp_select->can_read(0.1);  # Non-blocking check
+		for my $fh (@mcp_ready) {
 			if ($fh == \*STDIN) {
 				my $buffer;
 				my $bytes = sysread(STDIN, $buffer, 8192);
@@ -136,22 +172,22 @@ sub start_mcp_server {
 						print _error(undef, MCP_PARSE_ERROR, "Parse error: $@") . "\n";
 					}
 				}
-			}else {
-				# Check if this is a PTY, a Unix socket, or a client
-				my $handled = 0;
-				foreach my ($name, $bridge) (%bridges) {
-					if ($fh == $bridge->{pty} || $fh == $bridge->{socket} || exists $bridge->{clients}->{ fileno($fh) }) {
-						monitor_bridge($name, $fh);
-						$handled = 1;
-						last;
-					}
-				}
-				unless ($handled) {
-					debug("Unknown filehandle ready: " . fileno($fh));
-					$mcp_select->remove($fh);
-				}
 			}
 		}
+		
+		# Handle each bridge with its dedicated select (parallel processing)
+		foreach my $vm_name (keys %bridges) {
+			my $bridge = $bridges{$vm_name};
+			next unless $bridge && $bridge->{select};
+			
+			my @bridge_ready = $bridge->{select}->can_read(0.1);  # Non-blocking check
+			for my $fh (@bridge_ready) {
+				monitor_bridge($vm_name, $fh);
+			}
+		}
+		
+		# Small sleep to prevent CPU spinning
+		select(undef, undef, undef, 0.01);
 	}
 }
 # Tool definitions
@@ -341,7 +377,7 @@ sub start_bridge {
 	my ($read_pipe, $write_pipe);
 	unless (pipe($read_pipe, $write_pipe)) {
 		debug("Failed to create pipe: $!");
-		return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_SERVER_ERROR,message =>"Failed to create communication pipe for VM: $vm_name"}};
+		return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_SERVER_ERROR,message =>"Failed to create communication pipe for VM: $vm_name :".$! }};
 	}
 	# Fork to handle the bridge
 	my $pid = fork();
@@ -387,7 +423,7 @@ sub start_bridge {
 		debug("Failed to create socket: $!");
 		kill('TERM', $pid) if $pid;
 		$pty->close();
-		return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_SERVER_ERROR,message => "Failed to create Unix socket for VM: $vm_name"}};
+		return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_SERVER_ERROR,message => "Failed to create Unix socket for VM: $vm_name :".$!}};
 	}
 	debug("Parent process: Unix socket created successfully");
 	# Set up select - add pipe to monitor child readiness
@@ -421,11 +457,19 @@ sub start_bridge {
 		debug("Parent process: Storing bridge info");
 		# Generate Session ID
 		my $session_id = sprintf("session_%s_%d", $vm_name, time());
-		# Store bridge info
-		$bridges{$vm_name} = {pty     => $pty,socket  => $socket,port    => $port,buffer  => [],pid     => $pid,session => {id      => $session_id,clients => {},}};
-		# Register PTY and Unix socket in main select loop
-		$mcp_select->add($pty);
-		$mcp_select->add($socket);
+		# Store bridge info with dedicated select for this bridge
+		$bridges{$vm_name} = {
+			pty     => $pty,
+			socket  => $socket,
+			port    => $port,
+			buffer  => [],
+			pid     => $pid,
+			session => {
+				id      => $session_id,
+				clients => {},
+			},
+			select  => IO::Select->new($pty, $socket),  # Dedicated select for this bridge
+		};
 		# Spawn terminal window linked to this session
 		spawn_terminal_client($vm_name, $socket_path);
 		return {success => 1,message => "Bridge started for VM: $vm_name",port => $port,socket => $socket_path,session_id => $session_id};
@@ -538,7 +582,6 @@ sub stop_bridge {
 	kill('TERM', $bridge->{pid}) if $bridge->{pid};
 	# Close handles
 	if ($bridge->{pty}) {
-		$mcp_select->remove($bridge->{pty});
 		$bridge->{pty}->close();
 	}
 	$bridge->{socket}->close() if $bridge->{socket};
@@ -586,7 +629,7 @@ sub monitor_bridge {
 		if ($client) {
 			my $client_id = fileno($client);
 			$bridge->{session}->{clients}->{$client_id} = $client;
-			$mcp_select->add($client);
+			$bridge->{select}->add($client);  # Add to bridge's dedicated select
 			debug("Monitor: New client connected with ID $client_id");
 			# Send current buffer content to new client
 			if (@{ $bridge->{buffer} }) {
@@ -610,7 +653,7 @@ sub monitor_bridge {
 			# Client disconnected
 			my $client_id = fileno($fh);
 			debug("Monitor: Client $client_id disconnected");
-			$mcp_select->remove($fh);
+			$bridge->{select}->remove($fh);  # Remove from bridge's dedicated select
 			delete $bridge->{session}->{clients}->{$client_id};
 			close $fh;
 		}
@@ -628,44 +671,10 @@ sub cleanup {
 }
 # Run MCP server
 start_mcp_server() unless caller;
-# Terminal detection and spawning helpers
-sub detect_terminal {
-	# macOS Terminal.app in detect_terminal
-	if ($^O eq 'darwin') {
-		if (-d "/Applications/Terminal.app") {
-			return ['terminal-macos', sub { "open -a Terminal \"$_[0]\"" }];
-		}
-		if (-d "/Applications/iTerm.app") {
-			return ['iterm-macos', sub { "open -a iTerm \"$_[0]\"" }];
-		}
-	}
-	my %terminals = (
-		konsole    => [ 'konsole',        '-e' ],
-		gnome      => [ 'gnome-terminal', '-- sh -c' ],
-		xterm      => [ 'xterm',          '-e' ],
-		terminator => [ 'terminator',     '-e' ],
-		tilix      => [ 'tilix',          '-e' ],
-		alacritty  => [ 'alacritty',      '-e' ],
-		kitty      => [ 'kitty',          sub { "kitty $_[0]" } ],
-		urxvt      => [ 'urxvt',          '-e' ],
-		xfce4      => [ 'xfce4-terminal', '--command' ],
-		lxterminal => [ 'lxterminal',     '--command' ],
-		deepin     => [ 'deepin-terminal','-x' ],
-		mate       => [ 'mate-terminal',  '--command' ],
-		qterminal  => [ 'qterminal',      '-e' ],
-		wezterm    => [ 'wezterm',        sub { "wezterm start -- $_[0]" } ],
-	);
-	for my $name (keys %terminals) {
-		my $bin = $terminals{$name}[0];
-		return $terminals{$name} if can_run($bin);
-	}
-	return; # Return undef if no terminal found
-}
 sub spawn_terminal_client {
 	my ($vm_name, $socket_path) = @_;
 	debug("Attempting to spawn terminal for VM: $vm_name");
 	eval {
-		my $term = detect_terminal();
 		unless ($term) {
 			debug("No terminal detected");
 			return;
@@ -681,7 +690,7 @@ sub spawn_terminal_client {
 			}
 		};
 		my $shell_name = (split '/', $shell)[-1]; # Get shell basename (e.g., 'zsh', 'bash')
-		# Relaunch this script in internal client mode
+		 # Relaunch this script in internal client mode
 		my $cmd = "$^X $0 --socket=$socket_path";
 		my $full_cmd = do {
 			my ($terminal, $cmd) = ($term, $cmd);

@@ -1,4 +1,4 @@
-# SERENCP - The SERial COnsole to Vm MCP Server Usage Guide
+# SERENCP - The Serenity Serial Console viewer MCP Server Usage Guide
 
 (tested with QEMU/KVM/virt-manager and OpenCode)
 
@@ -219,6 +219,44 @@ The parent MCP server uses `IO::Select` to multiplex:
 
 When the VM disconnects, the parent detects the PTY closure and automatically restarts the bridge child to maintain persistence.
 
+## Sequence Diagram
+
+sequenceDiagram
+autonumber
+participant VM as VM (serial console)
+participant TCP as IO::Socket::INET (TCP 127.0.0.1:port)
+participant Bridge as Bridge process (child)
+participant PTY as IO::Pty (master/slave)
+participant MCP as MCP server (parent)
+participant USock as IO::Socket::UNIX (/tmp/serial_<vm>)
+participant Term as Terminal client
+
+%% Initial connection
+MCP->>Bridge: fork() + PTY creation
+Bridge->>TCP: TCP connection to the VM's serial port
+TCP-->>Bridge: OK (socket connected)
+Bridge-->>MCP: READY via pipe
+
+%% VM -> user flow
+VM-->>TCP: Serial output (bytes)
+TCP-->>Bridge: Raw data
+Bridge-->>PTY: Write into PTY slave
+PTY-->>MCP: Data read from PTY master
+MCP->>MCP: Buffer ring + JSON stdout notification
+MCP-->>USock: Make data available to clients
+
+Term-->>USock: Unix socket connection
+USock-->>MCP: New connection accepted()
+MCP-->>Term: History + live stream
+
+%% User -> VM flow
+Term-->>USock: Keyboard input (command)
+USock-->>MCP: Client data
+MCP-->>PTY: Write into PTY master
+PTY-->>Bridge: Data read from PTY slave
+Bridge-->>TCP: Write to TCP socket
+TCP-->>VM: Command received on the serial console
+
 ### Terminal Access
 For direct interaction outside of the MCP environment, you can use the script itself as a client:
 ```bash
@@ -232,19 +270,3 @@ New connections automatically receive the last 50 lines of history. Live output 
 - **No live notifications**: Ensure your MCP client supports notification handling. Notifications are sent automatically when VM output is received.
 - **Socket Permission**: Ensure `/tmp` is writable by the user running the MCP server.
 - **Syntax Check**: Run `perl -c serencp.pl` to verify script integrity.
-
-## Testing
-
-The implementation includes comprehensive test files:
-
-- **`test_notification_function.pl`**: Tests the notification function directly
-- **`test_backward_compatibility.pl`**: Verifies existing tools still work
-- **`mock_vm_notifications.py`**: Mock VM server for testing
-- **`test_live_notifications.sh`**: Integration test script
-
-Run tests with:
-```bash
-perl test_notification_function.pl
-perl test_backward_compatibility.pl
-./test_live_notifications.sh
-```
