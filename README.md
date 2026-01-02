@@ -17,6 +17,7 @@ It uses `IO::Pty` to create a pseudo-terminal (PTY) for the VM serial console. I
 - **Zombie Management**: Built-in process reaper prevents zombie processes from forks.
 
 ## Prerequisites
+- Should be installed on a *nix system.
 - Perl with `IO::Pty` and `JSON::PP` modules installed.
 - VM running with serial console on a TCP port (default starts at 4555).
 - It does not require root permissions.

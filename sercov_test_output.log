@@ -1,2 +1,0 @@
-{"params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"version":"1.0.0","name":"manual_test"}},"id":1,"jsonrpc":"2.0","method":"initialize"}
-{"params":{"name":"start","arguments":{"port":4556,"vm_name":"test-vm"}},"method":"tools/call","jsonrpc":"2.0","id":2}

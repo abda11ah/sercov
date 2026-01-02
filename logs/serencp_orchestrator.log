@@ -1,2 +1,0 @@
-{"method":"notifications/log","params":{"message":"Starting VM Serial MCP Server...","timestamp":"2026-01-01 15:52:36","level":"debug"},"jsonrpc":"2.0"}
-{"jsonrpc":"2.0","method":"notifications/log","params":{"level":"debug","timestamp":"2026-01-01 15:52:42","message":"STDIN error: Resource temporarily unavailable. Shutting down..."}}

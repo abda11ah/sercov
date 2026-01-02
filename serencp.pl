@@ -10,6 +10,7 @@ use IO::Select;
 use POSIX qw(strftime WNOHANG setsid);
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 use IPC::Cmd qw(can_run);
+use Errno qw(EAGAIN EWOULDBLOCK EINTR);
 use Getopt::Long;
 our %options;
 GetOptions(\%options,'socket=s',);
@@ -26,7 +27,11 @@ if ($options{'socket'}) {
 # Configuration
 our $DEFAULT_VM_PORT   = 4555;
 our $RING_BUFFER_SIZE  = 1000;
+our $MAX_BUFFER_BYTES  = 10 * 1024 * 1024;  # 10MB per VM
 our $DEBUG             = 1;  # Enable debug output
+# Cleanup timeout configuration
+our $SIGTERM_TIMEOUT   = 5;   # Seconds to wait for SIGTERM to work
+our $SIGKILL_WAIT      = 1;   # Seconds to wait after SIGKILL
 # Simplified defaults for LLM use
 # MCP Error Constants
 use constant {
@@ -48,13 +53,18 @@ use constant {
 	MCP_CONTEXT_TOO_LARGE     => -32011,
 	MCP_UNSUPPORTED_FORMAT    => -32012,
 };
+# OS Compatibiltiy Check
+if ($^O !~ /^(linux|darwin|freebsd|openbsd|netbsd|solaris|aix|cygwin|dragonfly|midnightbsd|gnu|haiku|hpux|irix|minix|qnx|sco|sysv|unix)/i) {
+	print _error(undef, MCP_SERVER_ERROR, "Unsupported Operating System: $^O. This server only runs on *nix-like systems.") . "\n";
+	exit 1;
+}
 # Global state
 our %bridges;
 our $running = 1;
 # Main MCP select - handles only STDIN for JSON-RPC requests
 my $mcp_select = IO::Select->new(\*STDIN);
 # Terminal detection and spawning helpers
-our $term = do {
+our $term = sub {
 	# macOS Terminal.app detection - early return for efficiency
 	if ($^O eq 'darwin') {
 		return ['terminal-macos', sub { "open -a Terminal \"$_[0]\"" }]
@@ -87,7 +97,8 @@ our $term = do {
 		return $config if can_run($config->[0]);
 	}
 	undef; # Explicit undef return for clarity
-};
+	}
+	->();
 # Debug output function
 sub debug {
 	my ($message) = @_;
@@ -174,20 +185,17 @@ sub start_mcp_server {
 				}
 			}
 		}
-		
 		# Handle each bridge with its dedicated select (parallel processing)
 		foreach my $vm_name (keys %bridges) {
 			my $bridge = $bridges{$vm_name};
 			next unless $bridge && $bridge->{select};
-			
 			my @bridge_ready = $bridge->{select}->can_read(0.1);  # Non-blocking check
 			for my $fh (@bridge_ready) {
 				monitor_bridge($vm_name, $fh);
 			}
 		}
-		
 		# Small sleep to prevent CPU spinning
-		select(undef, undef, undef, 0.01);
+		sleep(0.01);
 	}
 }
 # Tool definitions
@@ -303,9 +311,9 @@ sub tool_serial_status {
 	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_INVALID_PARAMS,message => "vm_name parameter is required"}} unless $vm_name;
 	return do {
 		if (bridge_exists($vm_name)) {
-			{running     => 1,vm_name     => $vm_name,port        => $bridges{$vm_name}{port},buffer_size => scalar(@{ $bridges{$vm_name}->{buffer} })};
+			{running     => 1,vm_name     => $vm_name,port        => $bridges{$vm_name}{port},buffer_size => scalar(@{ $bridges{$vm_name}->{buffer} }),buffer_bytes => $bridges{$vm_name}{buffer_bytes} || 0};
 		}else {
-			{running     => 0,vm_name     => $vm_name,port        => undef,buffer_size => 0};
+			{running     => 0,vm_name     => $vm_name,port        => undef,buffer_size => 0,buffer_bytes => 0};
 		}
 	};
 }
@@ -393,7 +401,7 @@ sub start_bridge {
 		$pty->close();        # Close master end in child
 		 # Try to connect to VM serial console (raw TCP)
 		debug("Child process: Attempting to connect to VM serial console on port $port");
-		my $vm_socket = IO::Socket::INET->new(PeerAddr => '127.0.0.1',PeerPort => $port,Proto    => 'tcp',Timeout  => 5);
+		my $vm_socket = IO::Socket::INET->new(PeerAddr => '127.0.0.1',PeerPort => $port,Proto    => 'tcp',Timeout  => 10);
 		if ($vm_socket) {
 			debug("Child process: Connected to VM serial console successfully");
 			# Connection successful - signal parent
@@ -421,7 +429,7 @@ sub start_bridge {
 	my $socket = IO::Socket::UNIX->new(Type  => SOCK_STREAM,Local => $socket_path,Listen => 1);
 	unless ($socket) {
 		debug("Failed to create socket: $!");
-		kill('TERM', $pid) if $pid;
+		terminate_process($pid, "bridge child process for VM $vm_name (socket creation failed)") if $pid;
 		$pty->close();
 		return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_SERVER_ERROR,message => "Failed to create Unix socket for VM: $vm_name :".$!}};
 	}
@@ -449,6 +457,22 @@ sub start_bridge {
 				debug("Parent process: Child failed to connect");
 				last;
 			}
+			unless (defined $bytes && $bytes > 0) {
+				debug("Parent process: Failed to read from child pipe");
+				last;
+			}
+		}
+		# Check if child process is still alive
+		my $child_status = waitpid($pid, WNOHANG);
+		if ($child_status == $pid) {
+			# Child has exited
+			my $exit_code = ($? >> 8) & 0xFF;
+			debug("Parent process: Child process exited with status $exit_code");
+			last;
+		} elsif ($child_status == -1) {
+			# waitpid failed
+			debug("Parent process: waitpid failed: $!");
+			last;
 		}
 	}
 	$select->remove($read_pipe);
@@ -463,11 +487,9 @@ sub start_bridge {
 			socket  => $socket,
 			port    => $port,
 			buffer  => [],
+			buffer_bytes => 0,  # Track total bytes in buffer
 			pid     => $pid,
-			session => {
-				id      => $session_id,
-				clients => {},
-			},
+			session => {id      => $session_id,clients => {},},
 			select  => IO::Select->new($pty, $socket),  # Dedicated select for this bridge
 		};
 		# Spawn terminal window linked to this session
@@ -476,7 +498,7 @@ sub start_bridge {
 	}else {
 		debug("Parent process: Bridge setup failed - cleaning up");
 		# Clean up on failure
-		kill('TERM', $pid) if $pid;
+		terminate_process($pid, "bridge child process for VM $vm_name (setup failed)") if $pid;
 		$pty->close();
 		$socket->close();
 		unlink $socket_path if -e $socket_path;
@@ -489,8 +511,8 @@ sub bridge_process_child {
 	debug("Bridge child: Starting data bridge between VM and PTY");
 	# Buffer to capture initial output
 	my @initial_buffer;
-	my $initial_buffer_size = 200;
-	# First, read existing output from VM (up to 200 lines)
+	my $initial_buffer_size = $RING_BUFFER_SIZE;
+	# First, read existing output from VM
 	debug("Bridge child: Reading existing output from VM");
 	my $read_start = time();
 	while (time() - $read_start < 3) {    # Try for 3 seconds to get initial output
@@ -503,8 +525,13 @@ sub bridge_process_child {
 			my $text = $buffer;
 			$text =~ s/\r/\n/g;
 			for my $l (split /\n/, $text) {
-				push @initial_buffer, $l if $l;
-				shift @initial_buffer while @initial_buffer > $initial_buffer_size;
+				next unless $l;  # Skip empty lines
+				# Add line to buffer
+				push @initial_buffer, $l;
+				# Enforce line count limit only (byte limit is unnecessary for temporary buffer)
+				while (@initial_buffer > $initial_buffer_size) {
+					shift @initial_buffer;
+				}
 			}
 			# Write to PTY slave to pass to parent
 			syswrite($pty_slave, $buffer);
@@ -535,10 +562,6 @@ sub bridge_process_child {
 				my $buffer;
 				my $bytes = sysread($vm_socket, $buffer, 4096);
 				next if $!{EINTR} || $!{EAGAIN};
-				# if (!defined $bytes || $bytes == 0) {
-				#     debug("Bridge child: VM disconnected, exiting loop");
-				#     last;
-				# }
 				if ($bytes > 0) {
 					debug("Bridge child: Read $bytes bytes from VM");
 					# No need to filter telnet control chars for raw TCP
@@ -551,10 +574,6 @@ sub bridge_process_child {
 				my $buffer;
 				my $bytes = sysread($pty_slave, $buffer, 4096);
 				next if $!{EINTR} || $!{EAGAIN};
-				# if (!defined $bytes || $bytes == 0) {
-				#     debug("Bridge child: PTY disconnected, exiting loop");
-				#     last;
-				# }
 				if ($bytes > 0) {
 					debug("Bridge child: Read $bytes bytes from PTY, forwarding to VM");
 					syswrite($vm_socket, $buffer);
@@ -573,13 +592,52 @@ sub bridge_process_child {
 	close $vm_socket;
 	close $pty_slave;
 }
+# Robust process termination with SIGTERM + SIGKILL fallback
+sub terminate_process {
+	my ($pid, $process_desc) = @_;
+	$process_desc ||= "process";
+	return unless $pid && kill(0, $pid);  # Check if process exists
+	debug("Sending SIGTERM to $process_desc (PID: $pid)");
+	kill('TERM', $pid);
+	# Wait up to timeout for graceful termination
+	my $start_time = time();
+	while (time() - $start_time < $SIGTERM_TIMEOUT) {
+		my $wait_result = waitpid($pid, WNOHANG);
+		if ($wait_result == $pid) {
+			debug("$process_desc (PID: $pid) terminated gracefully");
+			return 1;
+		} elsif ($wait_result == -1) {
+			debug("waitpid failed for $process_desc (PID: $pid): $!");
+			last;
+		}
+		sleep(0.1);
+	}
+	# Check if process is still alive and send SIGKILL if needed
+	if (kill(0, $pid)) {
+		debug("$process_desc (PID: $pid) still alive after SIGTERM timeout, sending SIGKILL");
+		kill('KILL', $pid);
+		# Final wait for SIGKILL to take effect
+		sleep($SIGKILL_WAIT);
+		# Final check
+		if (kill(0, $pid)) {
+			debug("Warning: $process_desc (PID: $pid) still alive after SIGKILL");
+			return 0;
+		} else {
+			debug("$process_desc (PID: $pid) terminated by SIGKILL");
+			return 1;
+		}
+	}
+	return 1;
+}
 # Stop bridge for VM
 sub stop_bridge {
 	my ($vm_name) = @_;
 	return unless bridge_exists($vm_name);
 	my $bridge = $bridges{$vm_name};
-	# Kill child processes
-	kill('TERM', $bridge->{pid}) if $bridge->{pid};
+	# Kill child processes robustly
+	if ($bridge->{pid}) {
+		terminate_process($bridge->{pid}, "bridge child process for VM $vm_name");
+	}
 	# Close handles
 	if ($bridge->{pty}) {
 		$bridge->{pty}->close();
@@ -590,6 +648,21 @@ sub stop_bridge {
 	unlink $socket_path if -e $socket_path;
 	# Clean up
 	delete $bridges{$vm_name};
+}
+# Helper to send data to client with non-blocking support
+# Returns 1 if success or transient error (keep client), 0 if fatal error (disconnect client)
+sub send_to_client {
+	my ($client, $data) = @_;
+	return 1 unless defined $client && defined $data;
+	my $written = syswrite($client, $data);
+	if (defined $written) {
+		return 1;
+	}
+	# Handle non-blocking errors
+	if ($! == EAGAIN || $! == EWOULDBLOCK || $! == EINTR) {
+		return 1; # Drop data, but keep client alive
+	}
+	return 0; # Fatal error
 }
 # Monitor bridge for PTY and Unix socket communication (single filehandle processing)
 sub monitor_bridge {
@@ -608,25 +681,43 @@ sub monitor_bridge {
 			my $text = $buffer;
 			$text =~ s/\r/\n/g;
 			for my $l (split /\n/, $text) {
-				push @{ $bridge->{buffer} }, $l if $l;
-				shift @{ $bridge->{buffer} }while @{ $bridge->{buffer} } > $RING_BUFFER_SIZE;
+				next unless $l;  # Skip empty lines
+				my $line_length = length($l);
+				# Add line to buffer and update byte count
+				push @{ $bridge->{buffer} }, $l;
+				$bridge->{buffer_bytes} += $line_length;
+				# Enforce both line count and byte size limits
+				while (@{ $bridge->{buffer} } > $RING_BUFFER_SIZE || $bridge->{buffer_bytes} > $MAX_BUFFER_BYTES) {
+					my $removed = shift @{ $bridge->{buffer} };
+					$bridge->{buffer_bytes} -= length($removed) if defined $removed;
+					debug("Buffer management: removed line (" . length($removed) . " bytes) for $vm_name. Current: " . scalar(@{ $bridge->{buffer} }) . " lines, " . $bridge->{buffer_bytes} . " bytes");
+				}
 			}
-			# Forward to all connected terminal window clients
+			# Forward to all connected unix socket clients
 			my $client_count = scalar keys %{ $bridge->{session}->{clients} };
 			debug("Monitor: Forwarding to $client_count clients");
-			for my $client (values %{ $bridge->{session}->{clients} }) {
-				eval { syswrite($client, $buffer); };
+			for my $cid (keys %{ $bridge->{session}->{clients} }) {
+				my $client = $bridge->{session}->{clients}->{$cid};
+				unless (send_to_client($client, $buffer)) {
+					debug("Monitor: Client $cid write failed, removing.");
+					$bridge->{select}->remove($client);
+					delete $bridge->{session}->{clients}->{$cid};
+					close $client;
+				}
 			}
 		}elsif (defined $bytes && $bytes == 0) {
 			debug("Server: PTY for $vm_name signaled EOF - VM bridge likely died");
 			# Auto-restart bridge
 			debug("VM disconnected - auto-restart bridge for $vm_name");
-			start_bridge($vm_name, $bridge->{port});
+			my $port = $bridge->{port};
+			stop_bridge($vm_name);
+			start_bridge($vm_name, $port);
 		}
 	}elsif ($fh == $bridge->{socket}) {
 		# New terminal window client connection
 		my $client = $bridge->{socket}->accept();
 		if ($client) {
+			$client->blocking(0); # Ensure non-blocking
 			my $client_id = fileno($client);
 			$bridge->{session}->{clients}->{$client_id} = $client;
 			$bridge->{select}->add($client);  # Add to bridge's dedicated select
@@ -639,7 +730,7 @@ sub monitor_bridge {
 					: 0;
 				my $history = join("\n",@{ $bridge->{buffer} }[ $start .. $#{ $bridge->{buffer} } ]). "\n";
 				debug("Monitor: Sending history (" . length($history) . " bytes) to new client");
-				eval { syswrite($client, $history); };
+				send_to_client($client, $history);
 			}
 		}
 	}elsif (exists $bridge->{session}->{clients}->{ fileno($fh) }) {
@@ -675,52 +766,172 @@ sub spawn_terminal_client {
 	my ($vm_name, $socket_path) = @_;
 	debug("Attempting to spawn terminal for VM: $vm_name");
 	eval {
-		unless ($term) {
-			debug("No terminal detected");
+		# Terminal detection with fallback mechanism
+		my $terminal_config = $term;
+		unless ($terminal_config) {
+			debug("No standard terminal detected, attempting fallback methods");
+			# Try fallback terminals in order of preference
+			my @fallback_terminals = (
+				['generic-xterm', ['xterm', '-e']],
+				['generic-sh',   ['sh', '-c']],
+				[
+					'fallback-echo',
+					[
+						'echo',
+						sub {
+							"echo 'Terminal spawning failed. Please connect manually to: $_[0]'"
+						}
+					]
+				],
+			);
+			for my $fallback (@fallback_terminals) {
+				my ($name, $config) = @$fallback;
+				if ($name eq 'fallback-echo' || can_run($config->[0])) {
+					$terminal_config = $config;
+					debug("Using fallback terminal: $name");
+					last;
+				}
+			}
+		}
+		# If still no terminal available, return error to MCP client
+		unless ($terminal_config) {
+			debug("All terminal detection methods failed");
+			# Send error notification to MCP client
+			my $error_notification = {
+				jsonrpc => "2.0",
+				method => "notifications/log",
+				params => {
+					level => "error",
+					message => "Terminal spawning failed: No compatible terminal emulator found. Please install one of: gnome-terminal, konsole, xterm, or Terminal.app (macOS)",
+					timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),
+					vm_name => $vm_name,
+					suggestion => "Manual connection: Connect to Unix socket at /tmp/serial_${vm_name}"
+				}
+			};
+			print STDOUT encode_json($error_notification) . "\n";
 			return;
 		}
-		# Detect current shell for universal compatibility
+		# Enhanced shell detection with validation
 		my $shell = do {
-			my $detected_shell = $ENV{SHELL} || '/bin/sh';
-			# Ensure it's a valid POSIX shell path
-			if (-x $detected_shell) {
-				$detected_shell;
+			# Try to detect current shell with better validation
+			if (exists $ENV{SHELL} && $ENV{SHELL} && -x $ENV{SHELL}) {
+				$ENV{SHELL};
+			} elsif (-x '/bin/bash') {
+				'/bin/bash';
+			} elsif (-x '/bin/sh') {
+				'/bin/sh';
+			} elsif (-x '/usr/bin/sh') {
+				'/usr/bin/sh';
 			} else {
-				'/bin/sh'; # Fallback to sh
+				# If no valid shell found, return error
+				debug("No valid shell detected");
+				my $error_notification = {
+					jsonrpc => "2.0",
+					method => "notifications/log",
+					params => {level => "error",message => "Shell detection failed: No valid POSIX shell found",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}
+				};
+				print STDOUT encode_json($error_notification) . "\n";
+				return;
 			}
 		};
 		my $shell_name = (split '/', $shell)[-1]; # Get shell basename (e.g., 'zsh', 'bash')
-		 # Relaunch this script in internal client mode
+		debug("Detected shell: $shell ($shell_name)");
+		# Relaunch this script in internal client mode
 		my $cmd = "$^X $0 --socket=$socket_path";
-		my $full_cmd = do {
-			my ($terminal, $cmd) = ($term, $cmd);
+		debug("Terminal command target: $cmd");
+		# Build terminal command with robust error handling
+		my $full_cmd;
+		eval {
+			my ($terminal, $terminal_cmd) = ($terminal_config, $cmd);
 			my ($bin, $prefix) = @$terminal;
-			# Adapt shell-specific prefixes to use detected shell
-			if ($prefix eq '-- sh -c') {
-				$prefix = "-- $shell_name -c";
-			}
+			# Handle different terminal types with enhanced compatibility
 			if ($bin eq 'terminal-macos' || $bin eq 'iterm-macos') {
-				$prefix->($cmd);
-			}elsif (ref $prefix eq 'CODE') {
-				$prefix->($cmd);
-			}elsif ($prefix =~ /-- \S+ -c$/) {
-				qq{$bin $prefix "$cmd; exec $shell_name"};
-			}else {
-				qq{$bin $prefix "$cmd"};
+				# macOS Terminal/iTerm2 handling
+				$full_cmd = $prefix->($terminal_cmd);
+			} elsif (ref $prefix eq 'CODE') {
+				# Custom terminal handlers (kitty, wezterm, etc.)
+				$full_cmd = $prefix->($terminal_cmd);
+			} elsif ($prefix eq '-- sh -c') {
+				# Convert to detected shell
+				$full_cmd = qq{$bin -- $shell_name -c "$terminal_cmd; exec $shell_name"};
+			} elsif ($prefix =~ /-- \S+ -c$/) {
+				# Convert existing shell-specific pattern
+				$prefix =~ s/-- (\S+) -c$/-- $shell_name -c/;
+				$full_cmd = qq{$bin $prefix "$terminal_cmd; exec $shell_name"};
+			} elsif ($prefix eq '-e' || $prefix eq '-x') {
+				# Simple terminal emulators
+				$full_cmd = qq{$bin $prefix "$terminal_cmd"};
+			} elsif ($prefix eq '--command') {
+				# Terminals requiring --command flag
+				$full_cmd = qq{$bin $prefix "$terminal_cmd"};
+			} else {
+				# Generic fallback
+				$full_cmd = qq{$bin $prefix "$terminal_cmd"};
 			}
+			debug("Constructed terminal command: $full_cmd");
 		};
-		debug("Spawning terminal command: $full_cmd");
-		# Fork and exec to detach
+		if ($@ || !$full_cmd) {
+			debug("Terminal command construction failed: $@");
+			my $error_notification = {
+				jsonrpc => "2.0",
+				method => "notifications/log",
+				params => {level => "error",message => "Terminal command construction failed: $@",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}
+			};
+			print STDOUT encode_json($error_notification) . "\n";
+			return;
+		}
+		# Fork and exec to detach with error handling
+		debug("Forking to spawn terminal: $full_cmd");
 		my $pid = fork();
+		if (!defined $pid) {
+			debug("Failed to fork for terminal spawn: $!");
+			my $error_notification = {
+				jsonrpc => "2.0",
+				method => "notifications/log",
+				params => {level => "error",message => "Failed to fork terminal process: $!",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}
+			};
+			print STDOUT encode_json($error_notification) . "\n";
+			return;
+		}
 		if ($pid == 0) {
-			# Child
-			setsid();    # Detach from terminal
-			exec($full_cmd);
-			exit(0);
+			# Child process
+			eval {
+				setsid();    # Detach from terminal
+				exec($full_cmd) or do {
+					# If exec fails, we need to report back somehow
+					debug("Terminal exec failed: $!");
+					exit(1);
+				};
+			};
+			if ($@) {
+				debug("Child process error: $@");
+				exit(1);
+			}
+		} else {
+			# Parent process - successful spawn
+			debug("Terminal spawned successfully with PID: $pid");
+			# Optional: Send success notification
+			if ($DEBUG) {
+				my $success_notification = {
+					jsonrpc => "2.0",
+					method => "notifications/log",
+					params => {level => "info",message => "Terminal spawned for VM: $vm_name (PID: $pid)",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}
+				};
+				print STDOUT encode_json($success_notification) . "\n";
+			}
 		}
 	};
 	if ($@) {
-		debug("Failed to spawn terminal: $@");
+		debug("Terminal spawning failed with exception: $@");
+		# Send error notification to MCP client
+		eval {
+			my $error_notification = {
+				jsonrpc => "2.0",
+				method => "notifications/log",
+				params => {level => "error",message => "Terminal spawning failed: $@",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}
+			};
+			print STDOUT encode_json($error_notification) . "\n";
+		};
 	}
 }
 # Internal Unix-socket client implementation
