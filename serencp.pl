@@ -2,7 +2,6 @@
 use strict;
 use warnings;
 use utf8;
-use feature 'say';
 use JSON::PP qw(decode_json encode_json);
 use IO::Socket::UNIX;
 use IO::Pty;
@@ -28,6 +27,7 @@ if ($options{'socket'}) {
 our $DEFAULT_VM_PORT   = 4555;
 our $RING_BUFFER_SIZE  = 1000;
 our $MAX_BUFFER_BYTES  = 10 * 1024 * 1024;  # 10MB per VM
+our $CONSOLE_HISTORY_LINES = 50;  # Lines of history to send to new console clients
 our $DEBUG             = 1;  # Enable debug output
 # Cleanup timeout configuration
 our $SIGTERM_TIMEOUT   = 5;   # Seconds to wait for SIGTERM to work
@@ -52,6 +52,10 @@ use constant {
 	MCP_PROMPT_TOO_LARGE      => -32010,
 	MCP_CONTEXT_TOO_LARGE     => -32011,
 	MCP_UNSUPPORTED_FORMAT    => -32012,
+	# Log Levels
+	MCP_LOG_LEVEL_DEBUG     => 'debug',
+	MCP_LOG_LEVEL_INFO      => 'info',
+	MCP_LOG_LEVEL_ERROR     => 'error',
 };
 # OS Compatibiltiy Check
 if ($^O !~ /^(linux|darwin|freebsd|openbsd|netbsd|solaris|aix|cygwin|dragonfly|midnightbsd|gnu|haiku|hpux|irix|minix|qnx|sco|sysv|unix)/i) {
@@ -93,7 +97,7 @@ our $term = sub {
 	);
 	# Return first available terminal - optimized loop
 	for my $terminal (@terminals) {
-		my ($name, $config) = @$terminal;
+		my (undef, $config) = @$terminal;
 		return $config if can_run($config->[0]);
 	}
 	undef; # Explicit undef return for clarity
@@ -103,7 +107,7 @@ our $term = sub {
 sub debug {
 	my ($message) = @_;
 	return unless $DEBUG;
-	my $log_entry = {jsonrpc => "2.0",method  => "notifications/log",params  => {level     => "debug",message   => $message,timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime)}};
+	my $log_entry = {jsonrpc => "2.0",method  => "notifications/log",params  => {level     => MCP_LOG_LEVEL_DEBUG,message   => $message,timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime)}};
 	print STDERR encode_json($log_entry) . "\n";
 }
 # Send VM output notification
@@ -282,7 +286,7 @@ sub tool_serial_start {
 	my $vm_name  = $params->{vm_name};
 	my $port     = $params->{port} || $DEFAULT_VM_PORT;
 	debug("Starting bridge for VM: $vm_name on port: $port");
-	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_INVALID_PARAMS,message => "vm_name parameter is required"}} unless $vm_name;
+	return _error(undef, MCP_INVALID_PARAMS, "vm_name parameter is required") unless $vm_name;
 	if (bridge_exists($vm_name)) {
 		debug("Stopping existing bridge for VM: $vm_name (fresh slate)");
 		tool_serial_stop({ vm_name => $vm_name });
@@ -295,7 +299,7 @@ sub tool_serial_stop {
 	# Normalize parameter keys to lowercase
 	$params = { map { lc($_) => $params->{$_} } keys %$params };
 	my $vm_name  = $params->{vm_name};
-	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_INVALID_PARAMS,message => "vm_name parameter is required"}} unless $vm_name;
+	return _error(undef, MCP_INVALID_PARAMS, "vm_name parameter is required") unless $vm_name;
 	if (!bridge_exists($vm_name)) {
 		return {success => 0,message => "No bridge running for VM: $vm_name"};
 	}
@@ -308,7 +312,7 @@ sub tool_serial_status {
 	# Normalize parameter keys to lowercase
 	$params = { map { lc($_) => $params->{$_} } keys %$params };
 	my $vm_name  = $params->{vm_name};
-	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_INVALID_PARAMS,message => "vm_name parameter is required"}} unless $vm_name;
+	return _error(undef, MCP_INVALID_PARAMS, "vm_name parameter is required") unless $vm_name;
 	return do {
 		if (bridge_exists($vm_name)) {
 			{running     => 1,vm_name     => $vm_name,port        => $bridges{$vm_name}{port},buffer_size => scalar(@{ $bridges{$vm_name}->{buffer} }),buffer_bytes => $bridges{$vm_name}{buffer_bytes} || 0};
@@ -649,21 +653,6 @@ sub stop_bridge {
 	# Clean up
 	delete $bridges{$vm_name};
 }
-# Helper to send data to client with non-blocking support
-# Returns 1 if success or transient error (keep client), 0 if fatal error (disconnect client)
-sub send_to_client {
-	my ($client, $data) = @_;
-	return 1 unless defined $client && defined $data;
-	my $written = syswrite($client, $data);
-	if (defined $written) {
-		return 1;
-	}
-	# Handle non-blocking errors
-	if ($! == EAGAIN || $! == EWOULDBLOCK || $! == EINTR) {
-		return 1; # Drop data, but keep client alive
-	}
-	return 0; # Fatal error
-}
 # Monitor bridge for PTY and Unix socket communication (single filehandle processing)
 sub monitor_bridge {
 	my ($vm_name, $fh) = @_;
@@ -714,7 +703,7 @@ sub monitor_bridge {
 			start_bridge($vm_name, $port);
 		}
 	}elsif ($fh == $bridge->{socket}) {
-		# New terminal window client connection
+		# New client connection
 		my $client = $bridge->{socket}->accept();
 		if ($client) {
 			$client->blocking(0); # Ensure non-blocking
@@ -725,8 +714,8 @@ sub monitor_bridge {
 			# Send current buffer content to new client
 			if (@{ $bridge->{buffer} }) {
 				my $start
-					= @{ $bridge->{buffer} } > 50
-					? @{ $bridge->{buffer} } - 50
+					= @{ $bridge->{buffer} } > $CONSOLE_HISTORY_LINES
+					? @{ $bridge->{buffer} } - $CONSOLE_HISTORY_LINES
 					: 0;
 				my $history = join("\n",@{ $bridge->{buffer} }[ $start .. $#{ $bridge->{buffer} } ]). "\n";
 				debug("Monitor: Sending history (" . length($history) . " bytes) to new client");
@@ -749,6 +738,21 @@ sub monitor_bridge {
 			close $fh;
 		}
 	}
+}
+# Helper to send data to client with non-blocking support
+# Returns 1 if success or transient error (keep client), 0 if fatal error (disconnect client)
+sub send_to_client {
+	my ($client, $data) = @_;
+	return 1 unless defined $client && defined $data;
+	my $written = syswrite($client, $data);
+	if (defined $written) {
+		return 1;
+	}
+	# Handle non-blocking errors
+	if ($! == EAGAIN || $! == EWOULDBLOCK || $! == EINTR) {
+		return 1; # Drop data, but keep client alive
+	}
+	return 0; # Fatal error
 }
 # Cleanup on exit
 sub cleanup {
@@ -801,7 +805,7 @@ sub spawn_terminal_client {
 				jsonrpc => "2.0",
 				method => "notifications/log",
 				params => {
-					level => "error",
+					level => MCP_LOG_LEVEL_ERROR,
 					message => "Terminal spawning failed: No compatible terminal emulator found. Please install one of: gnome-terminal, konsole, xterm, or Terminal.app (macOS)",
 					timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),
 					vm_name => $vm_name,
@@ -828,7 +832,7 @@ sub spawn_terminal_client {
 				my $error_notification = {
 					jsonrpc => "2.0",
 					method => "notifications/log",
-					params => {level => "error",message => "Shell detection failed: No valid POSIX shell found",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}
+					params => {level => MCP_LOG_LEVEL_ERROR,message => "Shell detection failed: No valid POSIX shell found",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}
 				};
 				print STDOUT encode_json($error_notification) . "\n";
 				return;
@@ -875,7 +879,7 @@ sub spawn_terminal_client {
 			my $error_notification = {
 				jsonrpc => "2.0",
 				method => "notifications/log",
-				params => {level => "error",message => "Terminal command construction failed: $@",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}
+				params => {level => MCP_LOG_LEVEL_ERROR,message => "Terminal command construction failed: $@",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}
 			};
 			print STDOUT encode_json($error_notification) . "\n";
 			return;
@@ -888,7 +892,7 @@ sub spawn_terminal_client {
 			my $error_notification = {
 				jsonrpc => "2.0",
 				method => "notifications/log",
-				params => {level => "error",message => "Failed to fork terminal process: $!",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}
+				params => {level => MCP_LOG_LEVEL_ERROR,message => "Failed to fork terminal process: $!",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}
 			};
 			print STDOUT encode_json($error_notification) . "\n";
 			return;
@@ -899,11 +903,33 @@ sub spawn_terminal_client {
 				setsid();    # Detach from terminal
 				exec($full_cmd) or do {
 					# If exec fails, we need to report back somehow
+					my $error_notification = {
+						jsonrpc => "2.0",
+						method  => "notifications/log",
+						params  => {
+							level     => MCP_LOG_LEVEL_ERROR,
+							message   => "Terminal exec failed: $!",
+							timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),
+							vm_name   => $vm_name
+						}
+					};
+					print STDOUT encode_json($error_notification) . "\n";
 					debug("Terminal exec failed: $!");
 					exit(1);
 				};
 			};
 			if ($@) {
+				my $error_notification = {
+					jsonrpc => "2.0",
+					method  => "notifications/log",
+					params  => {
+						level     => MCP_LOG_LEVEL_ERROR,
+						message   => "Child process error: $@",
+						timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),
+						vm_name   => $vm_name
+					}
+				};
+				print STDOUT encode_json($error_notification) . "\n";
 				debug("Child process error: $@");
 				exit(1);
 			}
@@ -915,7 +941,7 @@ sub spawn_terminal_client {
 				my $success_notification = {
 					jsonrpc => "2.0",
 					method => "notifications/log",
-					params => {level => "info",message => "Terminal spawned for VM: $vm_name (PID: $pid)",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}
+					params => {level => MCP_LOG_LEVEL_INFO,message => "Terminal spawned for VM: $vm_name (PID: $pid)",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}
 				};
 				print STDOUT encode_json($success_notification) . "\n";
 			}
@@ -928,7 +954,7 @@ sub spawn_terminal_client {
 			my $error_notification = {
 				jsonrpc => "2.0",
 				method => "notifications/log",
-				params => {level => "error",message => "Terminal spawning failed: $@",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}
+				params => {level => MCP_LOG_LEVEL_ERROR,message => "Terminal spawning failed: $@",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}
 			};
 			print STDOUT encode_json($error_notification) . "\n";
 		};
