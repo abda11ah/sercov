@@ -12,7 +12,7 @@ use IPC::Cmd qw(can_run);
 use Errno qw(EAGAIN EWOULDBLOCK EINTR);
 use Getopt::Long;
 our %options;
-GetOptions(\%options,'socket=s',);
+GetOptions(\%options,'socket=s',) or exit 1;
 # --- Internal Unix-socket client mode ---
 if ($options{'socket'}) {
 	my $socket_path = $options{'socket'};
@@ -27,11 +27,12 @@ if ($options{'socket'}) {
 our $DEFAULT_VM_PORT   = 4555;
 our $RING_BUFFER_SIZE  = 1000;
 our $MAX_BUFFER_BYTES  = 10 * 1024 * 1024;  # 10MB per VM
-our $CONSOLE_HISTORY_LINES = 50;  # Lines of history to send to new console clients
+our $CONSOLE_HISTORY_LINES = 60;  # Lines of history to send to new console clients
 our $DEBUG             = 0;  # Enable debug output
 # Cleanup timeout configuration
 our $SIGTERM_TIMEOUT   = 5;   # Seconds to wait for SIGTERM to work
 our $SIGKILL_WAIT      = 1;   # Seconds to wait after SIGKILL
+our $READ_TIMEOUT      = 10;  # Seconds to wait for read operation
 # Simplified defaults for LLM use
 # MCP Error Constants
 use constant {
@@ -103,6 +104,44 @@ our $term = sub {
 	undef; # Explicit undef return for clarity
 	}
 	->();
+# Tool definitions
+my %TOOLS = (
+	start => {
+		description => "Start the bridge for VM serial console communication.",
+		inputSchema => {
+			type       => "object",
+			properties => {vm_name => {type        => "string",description => "Name of the VM"},port => {type        => "string",description => "Port number for VM serial console (default: 4555)"}},
+			required => ["vm_name"]
+		},
+		handler => \&tool_serial_start
+	},
+	stop => {
+		description => "Stop the bridge.",
+		inputSchema => {type       => "object",properties => {vm_name => {type        => "string",description => "Name of the VM"}},required => ["vm_name"]},
+		handler => \&tool_serial_stop
+	},
+	status => {
+		description => "Check the status of the bridge.",
+		inputSchema => {type       => "object",properties => {vm_name => {type        => "string",description => "Name of the VM"}},required => ["vm_name"]},
+		handler => \&tool_serial_status
+	},
+	read => {
+		description => "Read output from VM serial console (20s timeout).",
+		inputSchema => {type       => "object",properties => {vm_name => {type        => "string",description => "Name of the VM"}},required => ["vm_name"]},
+		handler => \&tool_serial_read
+	},
+	write => {
+		description => "Send a command to the VM serial console.",
+		inputSchema => {
+			type       => "object",
+			properties => {vm_name => {type        => "string",description => "Name of the VM"},text => {type        => "string",description => "Command to send to the VM"}},
+			required => [ "vm_name", "text" ]
+		},
+		handler => \&tool_serial_write
+	}
+);
+# Run MCP server
+start_mcp_server() unless caller;
 # Debug output function
 sub debug {
 	my ($message) = @_;
@@ -202,42 +241,6 @@ sub start_mcp_server {
 		sleep(0.01);
 	}
 }
-# Tool definitions
-my %TOOLS = (
-	start => {
-		description => "Start the bridge for VM serial console communication.",
-		inputSchema => {
-			type       => "object",
-			properties => {vm_name => {type        => "string",description => "Name of the VM"},port => {type        => "string",description => "Port number for VM serial console (default: 4555)"}},
-			required => ["vm_name"]
-		},
-		handler => \&tool_serial_start
-	},
-	stop => {
-		description => "Stop the bridge.",
-		inputSchema => {type       => "object",properties => {vm_name => {type        => "string",description => "Name of the VM"}},required => ["vm_name"]},
-		handler => \&tool_serial_stop
-	},
-	status => {
-		description => "Check the status of the bridge.",
-		inputSchema => {type       => "object",properties => {vm_name => {type        => "string",description => "Name of the VM"}},required => ["vm_name"]},
-		handler => \&tool_serial_status
-	},
-	read => {
-		description => "Read output from VM serial console (20s timeout).",
-		inputSchema => {type       => "object",properties => {vm_name => {type        => "string",description => "Name of the VM"}},required => ["vm_name"]},
-		handler => \&tool_serial_read
-	},
-	write => {
-		description => "Send a command to the VM serial console.",
-		inputSchema => {
-			type       => "object",
-			properties => {vm_name => {type        => "string",description => "Name of the VM"},text => {type        => "string",description => "Command to send to the VM"}},
-			required => [ "vm_name", "text" ]
-		},
-		handler => \&tool_serial_write
-	}
-);
 # Handle JSON RPC requests
 sub handle_request {
 	my ($request) = @_;
@@ -332,10 +335,22 @@ sub tool_serial_read {
 	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_RESOURCE_NOT_FOUND,message => "Bridge not running for VM: $vm_name. Use start to start it."}} unless bridge_exists($vm_name);
 	return do {
 		my $bridge = $bridges{$vm_name};
+		my $start_time = time();
+		my $initial_lines = scalar(@{ $bridge->{buffer} });
+		debug("VM buffer has $initial_lines lines, waiting up to $READ_TIMEOUT seconds for new data");
+		# Wait for new data up to the timeout period
+		while (time() - $start_time < $READ_TIMEOUT) {
+			# Check if new data has arrived
+			if (scalar(@{ $bridge->{buffer} }) > $initial_lines) {
+				last;
+			}
+			# Small sleep to prevent CPU spinning
+			sleep(0.1);
+		}
 		my @lines  = @{ $bridge->{buffer} };
-		debug("VM buffer has " . scalar(@lines) . " lines");
-		# Always return last 100 lines (or fewer if buffer is smaller)
-		my $return_lines = 100;
+		debug("VM buffer now has " . scalar(@lines) . " lines after timeout");
+		# Always return last $CONSOLE_HISTORY_LINES lines (or fewer if buffer is smaller)
+		my $return_lines = $CONSOLE_HISTORY_LINES;
 		$return_lines = $RING_BUFFER_SIZE if $RING_BUFFER_SIZE < $return_lines;
 		my $start = @lines > $return_lines ? @lines - $return_lines : 0;
 		my $output = join("\n", @lines[ $start .. $#lines ]);
@@ -764,8 +779,6 @@ sub cleanup {
 	debug("VM Serial MCP Server stopped");
 	exit(0);
 }
-# Run MCP server
-start_mcp_server() unless caller;
 sub spawn_terminal_client {
 	my ($vm_name, $socket_path) = @_;
 	debug("Attempting to spawn terminal for VM: $vm_name");
