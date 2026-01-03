@@ -147,6 +147,22 @@ The JSON notification contains:
     "timestamp": "2026-01-01T09:19:08.000Z"
   }
 }
+
+### Example Log Notification
+
+When an error occurs (e.g., terminal spawn failure):
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/log",
+  "params": {
+    "level": "error",
+    "message": "Terminal spawning failed: ...",
+    "timestamp": "2026-01-01T09:19:08",
+    "vm_name": "test-vm"
+  }
+}
+```
 ```
 
 ### Potential Issues

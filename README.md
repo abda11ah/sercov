@@ -17,7 +17,7 @@ It uses `IO::Pty` to create a pseudo-terminal (PTY) for the VM serial console. I
 - **Zombie Management**: Built-in process reaper prevents zombie processes from forks.
 
 ## Prerequisites
-- Should be installed on a *nix system.
+- **Operating System**: Strictly requires a *nix-like system (Linux, macOS, BSD, etc.). Windows is NOT supported (unless via WSL).
 - Perl with `IO::Pty` and `JSON::PP` modules installed.
 - VM running with serial console on a TCP port (default starts at 4555).
 - It does not require root permissions.
@@ -32,6 +32,7 @@ The script automatically detects and supports the following terminal emulators:
 - `gnome-terminal` (GNOME)
 - `xterm` (classic X11 terminal)
 - `terminator` (advanced tiling terminal)
+- `guake` (drop-down terminal)
 - `tilix` (GTK3 tiling terminal)
 - `alacritty` (GPU-accelerated terminal)
 - `kitty` (GPU-accelerated terminal)
@@ -42,6 +43,7 @@ The script automatically detects and supports the following terminal emulators:
 - `mate-terminal` (MATE desktop)
 - `qterminal` (LXQt desktop)
 - `wezterm` (cross-platform terminal)
+- `ghostty` (modern GPU-accelerated terminal)
 
 **macOS:**
 - `Terminal.app` (built-in macOS terminal)
@@ -160,6 +162,22 @@ client.on('notification', (notification) => {
 - **Efficient**: Push-based model reduces overhead compared to polling
 - **Timestamped**: Each chunk includes precise timing information
 - **Backward Compatible**: Existing `read` tool continues to work for pull-based access
+
+### `notifications/log`
+The server also sends log messages for errors, warnings, and debug info (if enabled).
+
+```json
+{
+    "jsonrpc": "2.0",
+    "method": "notifications/log",
+    "params": {
+        "level": "error", // or "info", "debug"
+        "message": "Description of the event",
+        "timestamp": "2026-01-01T08:45:23.000Z",
+        "vm_name": "vm1" // Optional, if related to a specific VM
+    }
+}
+```
 
 ## Available Tools
 
