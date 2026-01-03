@@ -28,7 +28,7 @@ our $DEFAULT_VM_PORT   = 4555;
 our $RING_BUFFER_SIZE  = 1000;
 our $MAX_BUFFER_BYTES  = 10 * 1024 * 1024;  # 10MB per VM
 our $CONSOLE_HISTORY_LINES = 60;  # Lines of history to send to new console clients
-our $DEBUG             = 0;  # Enable debug output
+our $DEBUG             = 1;  # Enable debug output
 # Cleanup timeout configuration
 our $SIGTERM_TIMEOUT   = 5;   # Seconds to wait for SIGTERM to work
 our $SIGKILL_WAIT      = 1;   # Seconds to wait after SIGKILL

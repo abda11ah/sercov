@@ -1,0 +1,17 @@
+
+[2026-01-03T13:03:10.912982] (+0.0s) SESSION_START
+------------------------------------------------------------
+session_id: session_512e6e59
+
+
+[2026-01-03T13:03:10.913489] (+0.001s) COMMAND_EXECUTION
+------------------------------------------------------------
+command: bash
+working_directory: /home/Abdou/serencp
+
+
+[2026-01-03T13:03:11.241354] (+0.328s) SESSION_STATE
+------------------------------------------------------------
+state: initialized
+details: {'command': 'bash', 'tmux_session': 'mcp_session_512e6e59', 'working_directory': '/home/Abdou/serencp'}
+

@@ -1,0 +1,24 @@
+
+[2026-01-03T12:08:50.656719] (+0.0s) SESSION_START
+------------------------------------------------------------
+session_id: session_eac3b8c2
+
+
+[2026-01-03T12:08:50.657227] (+0.001s) COMMAND_EXECUTION
+------------------------------------------------------------
+command: bash
+working_directory: /home/Abdou/serencp
+
+
+[2026-01-03T12:08:50.979253] (+0.323s) SESSION_STATE
+------------------------------------------------------------
+state: initialized
+details: {'command': 'bash', 'tmux_session': 'mcp_session_eac3b8c2', 'working_directory': '/home/Abdou/serencp'}
+
+
+[2026-01-03T12:09:09.250358] (+18.594s) INPUT_SENT
+------------------------------------------------------------
+Input Type: tmux_input
+Input Text: cd /home/Abdou/serencp && perl -c serencp.pl
+Input Repr: 'cd /home/Abdou/serencp && perl -c serencp.pl'
+

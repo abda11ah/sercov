@@ -1,0 +1,168 @@
+{
+  "session_id": "session_b99c2195",
+  "session_start_time": 1767442776.596039,
+  "events": [
+    {
+      "event_type": "session_start",
+      "timestamp": 1767442776.5960565,
+      "relative_time": 0.0,
+      "data": {
+        "session_id": "session_b99c2195"
+      }
+    },
+    {
+      "event_type": "command_execution",
+      "timestamp": 1767442776.5974183,
+      "relative_time": 0.001,
+      "data": {
+        "command": "bash",
+        "working_directory": "/home/Abdou/serencp"
+      }
+    },
+    {
+      "event_type": "session_state",
+      "timestamp": 1767442776.9224946,
+      "relative_time": 0.326,
+      "data": {
+        "state": "initialized",
+        "details": {
+          "command": "bash",
+          "tmux_session": "mcp_session_b99c2195",
+          "working_directory": "/home/Abdou/serencp"
+        }
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767442780.4542658,
+      "relative_time": 3.858,
+      "data": {
+        "input_text": "perl serencp.pl\n",
+        "input_type": "tmux_input",
+        "input_length": 16,
+        "input_repr": "'perl serencp.pl\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767442783.3420875,
+      "relative_time": 6.746,
+      "data": {
+        "input_text": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"opencode\",\"version\":\"1.0\"}}}\n",
+        "input_type": "tmux_input",
+        "input_length": 156,
+        "input_repr": "'{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"opencode\",\"version\":\"1.0\"}}}\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767442785.7739737,
+      "relative_time": 9.178,
+      "data": {
+        "input_text": "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
+        "input_type": "tmux_input",
+        "input_length": 47,
+        "input_repr": "'{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767442788.006615,
+      "relative_time": 11.411,
+      "data": {
+        "input_text": "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"start\",\"arguments\":{\"vm_name\":\"BEEMO_VM\",\"port\":\"4555\"}}}\n",
+        "input_type": "tmux_input",
+        "input_length": 122,
+        "input_repr": "'{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"start\",\"arguments\":{\"vm_name\":\"BEEMO_VM\",\"port\":\"4555\"}}}\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767442791.8642035,
+      "relative_time": 15.268,
+      "data": {
+        "input_text": "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"read\",\"arguments\":{\"vm_name\":\"BEEMO_VM\"}}}\n",
+        "input_type": "tmux_input",
+        "input_length": 107,
+        "input_repr": "'{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"read\",\"arguments\":{\"vm_name\":\"BEEMO_VM\"}}}\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767442801.303509,
+      "relative_time": 24.707,
+      "data": {
+        "input_text": "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"write\",\"arguments\":{\"vm_name\":\"BEEMO_VM\",\"text\":\"echo hello\\n\"}}}\n",
+        "input_type": "tmux_input",
+        "input_length": 130,
+        "input_repr": "'{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"write\",\"arguments\":{\"vm_name\":\"BEEMO_VM\",\"text\":\"echo hello\\\\n\"}}}\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767442804.0921392,
+      "relative_time": 27.496,
+      "data": {
+        "input_text": "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"read\",\"arguments\":{\"vm_name\":\"BEEMO_VM\"}}}\n",
+        "input_type": "tmux_input",
+        "input_length": 107,
+        "input_repr": "'{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"read\",\"arguments\":{\"vm_name\":\"BEEMO_VM\"}}}\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767442806.5603857,
+      "relative_time": 29.964,
+      "data": {
+        "input_text": "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"status\",\"arguments\":{\"vm_name\":\"BEEMO_VM\"}}}\n",
+        "input_type": "tmux_input",
+        "input_length": 109,
+        "input_repr": "'{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"status\",\"arguments\":{\"vm_name\":\"BEEMO_VM\"}}}\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767442810.8650384,
+      "relative_time": 34.269,
+      "data": {
+        "input_text": "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"write\",\"arguments\":{\"vm_name\":\"BEEMO_VM\",\"text\":\"ls\\n\"}}}\n",
+        "input_type": "tmux_input",
+        "input_length": 122,
+        "input_repr": "'{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"write\",\"arguments\":{\"vm_name\":\"BEEMO_VM\",\"text\":\"ls\\\\n\"}}}\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767442813.5908868,
+      "relative_time": 36.995,
+      "data": {
+        "input_text": "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"read\",\"arguments\":{\"vm_name\":\"BEEMO_VM\"}}}\n",
+        "input_type": "tmux_input",
+        "input_length": 107,
+        "input_repr": "'{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"read\",\"arguments\":{\"vm_name\":\"BEEMO_VM\"}}}\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767442816.5762014,
+      "relative_time": 39.98,
+      "data": {
+        "input_text": "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"write\",\"arguments\":{\"vm_name\":\"BEEMO_VM\",\"text\":\"root\\n\"}}}\n",
+        "input_type": "tmux_input",
+        "input_length": 125,
+        "input_repr": "'{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"write\",\"arguments\":{\"vm_name\":\"BEEMO_VM\",\"text\":\"root\\\\n\"}}}\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767442820.8584232,
+      "relative_time": 44.262,
+      "data": {
+        "input_text": "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"stop\",\"arguments\":{\"vm_name\":\"BEEMO_VM\"}}}\n",
+        "input_type": "tmux_input",
+        "input_length": 108,
+        "input_repr": "'{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"stop\",\"arguments\":{\"vm_name\":\"BEEMO_VM\"}}}\\n'"
+      }
+    }
+  ]
+}

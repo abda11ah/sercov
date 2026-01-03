@@ -1,0 +1,146 @@
+{
+  "session_id": "session_11be73a0",
+  "session_start_time": 1767438861.0497932,
+  "events": [
+    {
+      "event_type": "session_start",
+      "timestamp": 1767438861.049804,
+      "relative_time": 0.0,
+      "data": {
+        "session_id": "session_11be73a0"
+      }
+    },
+    {
+      "event_type": "command_execution",
+      "timestamp": 1767438861.0506275,
+      "relative_time": 0.001,
+      "data": {
+        "command": "bash",
+        "working_directory": "/home/Abdou/serencp"
+      }
+    },
+    {
+      "event_type": "session_state",
+      "timestamp": 1767438861.3720825,
+      "relative_time": 0.322,
+      "data": {
+        "state": "initialized",
+        "details": {
+          "command": "bash",
+          "tmux_session": "mcp_session_11be73a0",
+          "working_directory": "/home/Abdou/serencp"
+        }
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767438872.5115044,
+      "relative_time": 11.462,
+      "data": {
+        "input_text": "perl t/integration_test.pl\n",
+        "input_type": "tmux_input",
+        "input_length": 27,
+        "input_repr": "'perl t/integration_test.pl\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767438882.972608,
+      "relative_time": 21.923,
+      "data": {
+        "input_text": "pkill -f mock_vm_server; pkill -f serencp; sleep 1\n",
+        "input_type": "tmux_input",
+        "input_length": 51,
+        "input_repr": "'pkill -f mock_vm_server; pkill -f serencp; sleep 1\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767438920.0367835,
+      "relative_time": 58.987,
+      "data": {
+        "input_text": "^C\n",
+        "input_type": "tmux_input",
+        "input_length": 3,
+        "input_repr": "'^C\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767438940.2907176,
+      "relative_time": 79.241,
+      "data": {
+        "input_text": "pkill -f perl\n",
+        "input_type": "tmux_input",
+        "input_length": 14,
+        "input_repr": "'pkill -f perl\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767438950.844232,
+      "relative_time": 89.794,
+      "data": {
+        "input_text": "rm -f /tmp/serial_*\n",
+        "input_type": "tmux_input",
+        "input_length": 20,
+        "input_repr": "'rm -f /tmp/serial_*\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767438959.5354793,
+      "relative_time": 98.486,
+      "data": {
+        "input_text": "perl t/integration_test.pl\n",
+        "input_type": "tmux_input",
+        "input_length": 27,
+        "input_repr": "'perl t/integration_test.pl\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767439005.938051,
+      "relative_time": 144.888,
+      "data": {
+        "input_text": "\n",
+        "input_type": "tmux_input",
+        "input_length": 1,
+        "input_repr": "'\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767439016.3408415,
+      "relative_time": 155.291,
+      "data": {
+        "input_text": "^C",
+        "input_type": "tmux_input",
+        "input_length": 2,
+        "input_repr": "'^C'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767439027.1702626,
+      "relative_time": 166.12,
+      "data": {
+        "input_text": "perl t/integration_test.pl\n",
+        "input_type": "tmux_input",
+        "input_length": 27,
+        "input_repr": "'perl t/integration_test.pl\\n'"
+      }
+    },
+    {
+      "event_type": "input_sent",
+      "timestamp": 1767439065.5436594,
+      "relative_time": 204.494,
+      "data": {
+        "input_text": "^C\n",
+        "input_type": "tmux_input",
+        "input_length": 3,
+        "input_repr": "'^C\\n'"
+      }
+    }
+  ]
+}

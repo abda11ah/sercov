@@ -208,6 +208,9 @@ Stops the bridge for a specific VM.
 
 ## Architecture
 
+It connects to the VM serial console as client and provide a server pipe as /tmp/serial_VM_NAME.
+Then the terminal client connect to this pipe and provide a live terminal view while the MCP server handle the JSON-RPC commands and reply via MCP compliants notifications.
+
 ```mermaid
 graph TD
     VM["VM Serial Console (TCP:127.0.0.1:4555+)"]

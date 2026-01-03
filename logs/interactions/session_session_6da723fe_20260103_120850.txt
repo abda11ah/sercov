@@ -1,0 +1,24 @@
+
+[2026-01-03T12:08:50.197877] (+0.0s) SESSION_START
+------------------------------------------------------------
+session_id: session_6da723fe
+
+
+[2026-01-03T12:08:50.198986] (+0.001s) COMMAND_EXECUTION
+------------------------------------------------------------
+command: bash
+working_directory: /home/Abdou/serencp
+
+
+[2026-01-03T12:08:50.522816] (+0.325s) SESSION_STATE
+------------------------------------------------------------
+state: initialized
+details: {'command': 'bash', 'tmux_session': 'mcp_session_6da723fe', 'working_directory': '/home/Abdou/serencp'}
+
+
+[2026-01-03T12:09:09.927118] (+19.729s) INPUT_SENT
+------------------------------------------------------------
+Input Type: tmux_input
+Input Text: cd /home/Abdou/serencp && ./run_tests.sh 2>&1
+Input Repr: 'cd /home/Abdou/serencp && ./run_tests.sh 2>&1'
+

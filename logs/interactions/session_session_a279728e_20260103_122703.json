@@ -1,0 +1,33 @@
+{
+  "session_id": "session_a279728e",
+  "session_start_time": 1767439623.0398428,
+  "events": [
+    {
+      "event_type": "session_start",
+      "timestamp": 1767439623.0398488,
+      "relative_time": 0.0,
+      "data": {
+        "session_id": "session_a279728e"
+      }
+    },
+    {
+      "event_type": "command_execution",
+      "timestamp": 1767439623.0403874,
+      "relative_time": 0.001,
+      "data": {
+        "command": "bash",
+        "working_directory": "/home/Abdou/serencp"
+      }
+    },
+    {
+      "event_type": "error",
+      "timestamp": 1767439623.3588114,
+      "relative_time": 0.319,
+      "data": {
+        "error_type": "initialization_error",
+        "error_message": "tmux set-environment stderr: ['no such session: $4']",
+        "stack_trace": null
+      }
+    }
+  ]
+}

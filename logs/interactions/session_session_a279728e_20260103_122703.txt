@@ -1,0 +1,18 @@
+
+[2026-01-03T12:27:03.039849] (+0.0s) SESSION_START
+------------------------------------------------------------
+session_id: session_a279728e
+
+
+[2026-01-03T12:27:03.040387] (+0.001s) COMMAND_EXECUTION
+------------------------------------------------------------
+command: bash
+working_directory: /home/Abdou/serencp
+
+
+[2026-01-03T12:27:03.358811] (+0.319s) ERROR
+------------------------------------------------------------
+error_type: initialization_error
+error_message: tmux set-environment stderr: ['no such session: $4']
+stack_trace: None
+
