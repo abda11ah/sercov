@@ -11,7 +11,7 @@ It uses `IO::Pty` to create a pseudo-terminal (PTY) for the VM serial console. I
 ### Core Features:
 - **Persistent PTY**: Maintains a stable connection to the VM serial console.
 - **Auto-Restart**: Automatically detects VM disconnects and restarts the bridge for persistent interaction.
-- **Ring Buffer**: Maintains a ring buffer of the last 1000 lines of output.
+- **Ring Buffer**: Maintains a ring buffer of the last 1000 lines of output (10MB max per VM).
 - **Multi-Client Access**: Supports multiple simultaneous clients via a Unix socket at `/tmp/serial_${VM_NAME}`.
 - **Standard MCP**: Supports standard `tools/list` and `tools/call` methods for tool discovery and execution.
 - **Zombie Management**: Built-in process reaper prevents zombie processes from forks.
@@ -49,10 +49,18 @@ The script automatically detects and supports the following terminal emulators:
 - `Terminal.app` (built-in macOS terminal)
 - `iTerm.app` (iTerm2)
 
-The script will automatically detect which terminal is available on your system and use the appropriate command-line arguments to spawn a new terminal window connected to the VM serial console session.
+The script will automatically detect which terminal is available on your system and use the appropriate command-line arguments to spawn a new terminal window connected to the VM serial console session. If no terminal is detected, it provides fallback mechanisms and error notifications.
 
 ## Configuration
 
+### Default Constants
+- **Default VM Port**: 4555
+- **Ring Buffer Size**: 1000 lines
+- **Max Buffer Bytes**: 10MB per VM
+- **Console History Lines**: 60 lines (sent to new clients)
+- **Read Timeout**: 20 seconds (for read tool)
+
+### MCP Server Configuration
 Make sure the MCP server is configured in `opencode.jsonc`:
 ```json
 "mcp": {
@@ -201,7 +209,7 @@ Checks the status of the bridge.
 - **Returns**: `{"running": true/false, "vm_name": "...", "port": ..., "buffer_size": ...}`
 
 ### 3. `read`
-Reads the last 100 lines from the VM serial console ring buffer.
+Reads output from VM serial console with a 20-second timeout. Returns the last 60 lines from the ring buffer.
 - **Arguments**: `{"vm_name": "string"}`
 - **Returns**: `{"success": true, "output": "..."}`
 
@@ -215,8 +223,15 @@ Stops the bridge for a specific VM.
 
 ## Architecture
 
-It connects to the VM serial console as client and provide a server pipe as /tmp/serial_VM_NAME.
-Then the terminal client connect to this pipe and provide a live terminal view while the MCP server handle the JSON-RPC commands and reply via MCP compliants notifications.
+The script connects to the VM serial console as a client and provides a Unix socket server at `/tmp/serial_VM_NAME`. It supports both an internal Unix socket client mode and automatic terminal spawning. The MCP server handles JSON-RPC commands and replies via MCP-compliant notifications.
+
+### Internal Unix Socket Client Mode
+The script can be run in client mode to connect to an existing bridge:
+```bash
+./serencp.pl --socket=/tmp/serial_VM_NAME
+```
+
+This mode provides direct terminal access to the VM serial console through the Unix socket interface.
 
 ```mermaid
 graph TD
@@ -293,7 +308,7 @@ For direct interaction outside of the MCP environment, you can use the script it
 ```bash
 ./serencp.pl --socket=/tmp/serial_MYVM
 ```
-New connections automatically receive the last 50 lines of history. Live output notifications are sent automatically when VM data is received, providing real-time streaming without polling.
+New connections automatically receive the last 60 lines of history. Live output notifications are sent automatically when VM data is received, providing real-time streaming without polling.
 
 ## Troubleshooting
 - **Failed to get tools**: Ensure the script is run in an environment where standard input/output is captured. Use `tools/list` to verify connectivity.
