@@ -128,12 +128,16 @@ VM output is automatically streamed as JSON-RPC 2.0 notifications:
 ```json
 {
     "jsonrpc": "2.0",
-    "method": "notifications/vm_output",
+    "method": "notifications/message",
     "params": {
-        "vm": "vm1",
-        "stream": "stdout",
-        "chunk": "output data here",
-        "timestamp": "2026-01-01T08:45:23.000Z"
+        "level": "info",
+        "logger": "vm",
+        "data": {
+            "vm": "vm1",
+            "stream": "stdout",
+            "chunk": "output data here",
+            "timestamp": "2026-01-01T08:45:23.000Z"
+        }
     }
 }
 ```
@@ -149,8 +153,8 @@ MCP clients can listen for notifications:
 
 ```javascript
 client.on('notification', (notification) => {
-    if (notification.method === 'notifications/vm_output') {
-        const { vm, stream, chunk, timestamp } = notification.params;
+    if (notification.method === 'notifications/message' && notification.params.logger === 'vm') {
+        const { vm, stream, chunk, timestamp } = notification.params.data;
         console.log(`[${timestamp}] ${vm} (${stream}): ${chunk}`);
         // Render live output to UI
     }
@@ -163,18 +167,21 @@ client.on('notification', (notification) => {
 - **Timestamped**: Each chunk includes precise timing information
 - **Backward Compatible**: Existing `read` tool continues to work for pull-based access
 
-### `notifications/log`
-The server also sends log messages for errors, warnings, and debug info (if enabled).
+### `notifications/message`
+The server sends all log messages for errors, warnings, debug info (if enabled), and VM output using the standardized MCP logging notification.
 
 ```json
 {
     "jsonrpc": "2.0",
-    "method": "notifications/log",
+    "method": "notifications/message",
     "params": {
         "level": "error", // or "info", "debug"
-        "message": "Description of the event",
-        "timestamp": "2026-01-01T08:45:23.000Z",
-        "vm_name": "vm1" // Optional, if related to a specific VM
+        "logger": "serencp", // or "vm" for VM output
+        "data": {
+            "message": "Description of the event",
+            "timestamp": "2026-01-01T08:45:23.000Z",
+            "vm_name": "vm1" // Optional, if related to a specific VM
+        }
     }
 }
 ```
