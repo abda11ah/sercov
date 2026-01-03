@@ -28,7 +28,7 @@ our $DEFAULT_VM_PORT   = 4555;
 our $RING_BUFFER_SIZE  = 1000;
 our $MAX_BUFFER_BYTES  = 10 * 1024 * 1024;  # 10MB per VM
 our $CONSOLE_HISTORY_LINES = 60;  # Lines of history to send to new console clients
-our $DEBUG             = 1;  # Enable debug output
+our $DEBUG             = 0;  # Enable debug output
 # Cleanup timeout configuration
 our $SIGTERM_TIMEOUT   = 5;   # Seconds to wait for SIGTERM to work
 our $SIGKILL_WAIT      = 1;   # Seconds to wait after SIGKILL
@@ -528,75 +528,56 @@ sub start_bridge {
 sub bridge_process_child {
 	my ($vm_socket, $pty_slave) = @_;
 	debug("Bridge child: Starting data bridge between VM and PTY");
-	# Buffer to capture initial output
-	my @initial_buffer;
-	my $initial_buffer_size = $RING_BUFFER_SIZE;
-	# First, read existing output from VM
-	debug("Bridge child: Reading existing output from VM");
-	my $read_start = time();
-	while (time() - $read_start < 3) {    # Try for 3 seconds to get initial output
-		my $buffer;
-		my $bytes = sysread($vm_socket, $buffer, 4096);
-		next if $!{EINTR} || $!{EAGAIN};
-		if (defined $bytes && $bytes > 0) {
-			debug("Bridge child: Read $bytes bytes of initial output from VM");
-			# Add to initial buffer
-			my $text = $buffer;
-			$text =~ s/\r/\n/g;
-			for my $l (split /\n/, $text) {
-				next unless $l;  # Skip empty lines
-				 # Add line to buffer
-				push @initial_buffer, $l;
-				# Enforce line count limit only (byte limit is unnecessary for temporary buffer)
-				while (@initial_buffer > $initial_buffer_size) {
-					shift @initial_buffer;
-				}
-			}
-			# Write to PTY slave to pass to parent
-			syswrite($pty_slave, $buffer);
-			next if $!{EINTR} || $!{EAGAIN};
-		}else {
-			# No more data available or error
-			last;
-		}
-		# Non-blocking read check
-		$vm_socket->blocking(0);
-	}
-	$vm_socket->blocking(1);    # Reset to blocking mode
-	debug("Bridge child: Initial output captured: " . scalar(@initial_buffer) . " lines");
+	# Set both sockets to non-blocking mode immediately
+	$vm_socket->blocking(0);
+	$pty_slave->blocking(0);
 	# Set up select for multiplexing VM socket and PTY slave
 	my $select = IO::Select->new();
 	$select->add($vm_socket);
 	$select->add($pty_slave);   # Read commands from parent via PTY
-	my $loop_count = 0;
-	# Main loop
+	# Main loop - non-blocking I/O with select
 	while (1) {
-		$loop_count++;
-		my @ready;
-		# Use IO::Select timeout instead of alarm/die
-		@ready = $select->can_read(1);
+		# Use IO::Select for efficient multiplexing
+		my @ready = $select->can_read(0.1);  # 100ms timeout
 		for my $fh (@ready) {
 			if ($fh == $vm_socket) {
 				# Data from VM → PTY slave → PTY master → parent
 				my $buffer;
 				my $bytes = sysread($vm_socket, $buffer, 4096);
-				next if $!{EINTR} || $!{EAGAIN};
-				if ($bytes > 0) {
+				# Handle different read outcomes
+				if (!defined $bytes) {
+					# Check for temporary errors
+					next if $!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK};
+					# Actual error - break connection
+					debug("Bridge child: Error reading from VM socket: $!");
+					last;
+				} elsif ($bytes == 0) {
+					# EOF - VM connection closed
+					debug("Bridge child: VM socket closed connection");
+					last;
+				} elsif ($bytes > 0) {
 					debug("Bridge child: Read $bytes bytes from VM");
-					# No need to filter telnet control chars for raw TCP
 					# Write to PTY slave
 					syswrite($pty_slave, $buffer);
-					next if $!{EINTR} || $!{EAGAIN};
 				}
-			}elsif ($fh == $pty_slave) {
+			} elsif ($fh == $pty_slave) {
 				# Commands from parent PTY master → VM socket
 				my $buffer;
 				my $bytes = sysread($pty_slave, $buffer, 4096);
-				next if $!{EINTR} || $!{EAGAIN};
-				if ($bytes > 0) {
+				# Handle different read outcomes
+				if (!defined $bytes) {
+					# Check for temporary errors
+					next if $!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK};
+					# Actual error - break connection
+					debug("Bridge child: Error reading from PTY slave: $!");
+					last;
+				} elsif ($bytes == 0) {
+					# EOF - Parent closed connection
+					debug("Bridge child: PTY slave closed connection");
+					last;
+				} elsif ($bytes > 0) {
 					debug("Bridge child: Read $bytes bytes from PTY, forwarding to VM");
 					syswrite($vm_socket, $buffer);
-					next if $!{EINTR} || $!{EAGAIN};
 				}
 			}
 		}
@@ -605,7 +586,6 @@ sub bridge_process_child {
 			debug("Bridge child: VM socket no longer connected");
 			last;
 		}
-		last if @ready == 0 && $loop_count > 1000;    # Safety exit
 	}
 	debug("Bridge child: Closing connections");
 	close $vm_socket;
