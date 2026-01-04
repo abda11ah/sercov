@@ -322,3 +322,7 @@ New connections automatically receive the last 60 lines of history. Live output 
 The name `serencp` is a play on words:
 - `seren` - Serenity / Serial
 - `cp` - MCP (Model Context Protocol)
+
+## Feel free to contribute
+
+i still can't see output notifications on Opencode, the LLM still have to poll using the read tool to get output. Maybe Opencode does not support them correvtly or maybe i'm doing something wrong. Since it's a really complex script, your help / pull requests are much appreciated !
