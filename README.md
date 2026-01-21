@@ -175,16 +175,17 @@ client.on('notification', (notification) => {
 - **Timestamped**: Each chunk includes precise timing information
 - **Backward Compatible**: Existing `read` tool continues to work for pull-based access
 
-### `notifications/logging/message`
+### `notifications/message`
 The server sends all log messages for errors, warnings, debug info (if enabled), and VM output using the standardized MCP logging notification. This is the preferred way for clients to receive live updates.
 
 ```json
 {
     "jsonrpc": "2.0",
-    "method": "notifications/logging/message",
+    "method": "notifications/message",
     "params": {
         "level": "info", // or "error", "debug"
         "logger": "serencp", // or "vm/vm1" for VM output
+        "message": "Description of the event or raw VM output",
         "data": "Description of the event or raw VM output"
     }
 }

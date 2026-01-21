@@ -164,11 +164,12 @@ sub debug {
 
 	my $log_entry = {
 		jsonrpc => "2.0",
-		method  => "notifications/logging/message",
+		method  => "notifications/message",
 		params  => {
 			level  => MCP_LOG_LEVEL_DEBUG,
 			logger => "serencp",
-			data   => $message
+			message => $message,
+			data   => $message || {}
 		}
 	};
 	# Send to STDOUT for MCP clients to see.
@@ -196,10 +197,11 @@ sub send_json_notification {
 	# 2. Standard MCP logging notification for better client compatibility
 	my $log_notification = {
 		jsonrpc => "2.0",
-		method  => "notifications/logging/message",
+		method  => "notifications/message",
 		params  => {
 			level  => MCP_LOG_LEVEL_INFO,
 			logger => "vm/$vm_name",
+			message => $chunk_copy,
 			data   => $chunk_copy
 		}
 	};
@@ -375,11 +377,12 @@ sub tool_start {
 	$progressToken = $params->{_meta}->{progressToken} if $params->{_meta};
 	debug("Starting bridge for VM: $vm_name on port: $port");
 	return mcp_error(undef, MCP_INVALID_PARAMS, "vm_name parameter is required") unless $vm_name;
+	my $old_term_pid;
 	if (bridge_exists($vm_name)) {
 		debug("Stopping existing bridge for VM: $vm_name (fresh slate)");
-		tool_stop({ vm_name => $vm_name });
+		$old_term_pid = stop_bridge($vm_name, 0); # Don't kill terminal on restart
 	}
-	return start_bridge($vm_name, $port, $progressToken);
+	return start_bridge($vm_name, $port, $progressToken, $old_term_pid);
 }
 # Tool: Stop VM serial bridge
 sub tool_stop {
@@ -391,7 +394,7 @@ sub tool_stop {
 	if (!bridge_exists($vm_name)) {
 		return {success => 0,message => "No bridge running for VM: $vm_name"};
 	}
-	stop_bridge($vm_name);
+	stop_bridge($vm_name, 1); # Kill terminal on explicit stop
 	return {success => 1,message => "Bridge stopped for VM: $vm_name"};
 }
 # Tool: Check VM serial bridge status
@@ -466,7 +469,7 @@ sub bridge_exists {
 }
 # Start bridge for VM
 sub start_bridge {
-	my ($vm_name, $port, $progressToken) = @_;
+	my ($vm_name, $port, $progressToken, $old_term_pid) = @_;
 	$port //= $DEFAULT_VM_PORT;
 	debug("Creating bridge for $vm_name on port $port");
 	# Create PTY
@@ -612,15 +615,21 @@ sub start_bridge {
 			buffer_bytes => 0,  # Track total bytes in buffer
 			total_bytes_sent => 0,  # Track total bytes sent in notifications
 			pid     => $pid,
+			terminal_pid => $old_term_pid,
 			session => {id      => $session_id,clients => {},},
 			select  => IO::Select->new($pty, $socket),  # Dedicated select for this bridge
 		};
 		# Small delay to ensure socket is fully ready before spawning clients
 		sleep(0.5);
-		# Spawn terminal client for immediate interaction
-		debug("Spawning terminal client for immediate interaction");
-		my $term_pid = spawn_terminal_client($vm_name, $socket_path);
-		$bridges{$vm_name}->{terminal_pid} = $term_pid;
+		# Spawn terminal client for immediate interaction if not already running
+		my $term_pid = $old_term_pid;
+		if ($term_pid && kill(0, $term_pid)) {
+			debug("Terminal already running for VM: $vm_name (PID: $term_pid)");
+		} else {
+			debug("Spawning terminal client for immediate interaction");
+			$term_pid = spawn_terminal_client($vm_name, $socket_path);
+			$bridges{$vm_name}->{terminal_pid} = $term_pid;
+		}
 		debug("Manual connection available: Connect to Unix socket at /tmp/serial_${vm_name}");
 		return {success => 1,message => "Bridge started for VM: $vm_name",port => $port,socket => $socket_path,session_id => $session_id, terminal_pid => $term_pid};
 	}else {
@@ -740,15 +749,17 @@ sub terminate_process {
 }
 # Stop bridge for VM
 sub stop_bridge {
-	my ($vm_name) = @_;
+	my ($vm_name, $kill_terminal) = @_;
 	return unless bridge_exists($vm_name);
 	my $bridge = $bridges{$vm_name};
+	my $term_pid = $bridge->{terminal_pid};
 	# Kill child processes robustly
 	if ($bridge->{pid}) {
 		terminate_process($bridge->{pid}, "bridge child process for VM $vm_name");
 	}
-	if ($bridge->{terminal_pid}) {
-		terminate_process($bridge->{terminal_pid}, "terminal window for VM $vm_name");
+	if ($kill_terminal && $term_pid) {
+		terminate_process($term_pid, "terminal window for VM $vm_name");
+		$term_pid = undef;
 	}
 	# Close handles
 	if ($bridge->{pty}) {
@@ -760,6 +771,7 @@ sub stop_bridge {
 	unlink $socket_path if -e $socket_path;
 	# Clean up
 	delete $bridges{$vm_name};
+	return $term_pid;
 }
 # Monitor bridge for PTY and Unix socket communication (single filehandle processing)
 sub monitor_bridge {
@@ -809,8 +821,8 @@ sub monitor_bridge {
 			# Auto-restart bridge
 			debug("VM disconnected - auto-restart bridge for $vm_name");
 			my $port = $bridge->{port};
-			stop_bridge($vm_name);
-			start_bridge($vm_name, $port);
+			my $term_pid = stop_bridge($vm_name, 0); # Don't kill terminal on auto-restart
+			start_bridge($vm_name, $port, undef, $term_pid);
 		}
 	}elsif ($fh == $bridge->{socket}) {
 		# New client connection
@@ -909,14 +921,16 @@ sub spawn_terminal_client {
 		unless ($terminal_config) {
 			debug("All terminal detection methods failed");
 			# Send error notification to MCP client
+			my $msg = "Terminal spawning failed: No compatible terminal emulator found. Please install one of: gnome-terminal, konsole, xterm, or Terminal.app (macOS)";
 			my $error_notification = {
 				jsonrpc => "2.0",
-				method => "notifications/logging/message",
+				method => "notifications/message",
 				params => {
 					level => MCP_LOG_LEVEL_ERROR,
 					logger => "serencp",
+					message => $msg,
 					data => {
-						message => "Terminal spawning failed: No compatible terminal emulator found. Please install one of: gnome-terminal, konsole, xterm, or Terminal.app (macOS)",
+						message => $msg,
 						timestamp => iso8601(),
 						vm_name => $vm_name,
 						suggestion => "Manual connection: Connect to Unix socket at /tmp/serial_${vm_name}"
@@ -940,13 +954,15 @@ sub spawn_terminal_client {
 			} else {
 				# If no valid shell found, return error
 				debug("No valid shell detected");
+				my $msg = "Shell detection failed: No valid POSIX shell found";
 				my $error_notification = {
 					jsonrpc => "2.0",
-					method => "notifications/logging/message",
+					method => "notifications/message",
 					params => {
 						level => MCP_LOG_LEVEL_ERROR,
 						logger => "serencp",
-						data => {message => "Shell detection failed: No valid POSIX shell found",timestamp => iso8601(),vm_name => $vm_name}
+						message => $msg,
+						data => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}
 					}
 				};
 				print STDOUT encode_json($error_notification) . "\n";
@@ -990,12 +1006,18 @@ sub spawn_terminal_client {
 			debug("Constructed terminal command: $full_cmd");
 		};
 		if ($@ || !$full_cmd) {
-			debug("Terminal command construction failed: $@");
+			my $err = $@ || "Unknown error";
+			debug("Terminal command construction failed: $err");
+			my $msg = "Terminal command construction failed: $err";
 			my $error_notification = {
 				jsonrpc => "2.0",
-				method => "notifications/logging/message",
-				params =>
-					{level => MCP_LOG_LEVEL_ERROR,logger => "serencp",data => {message => "Terminal command construction failed: $@",timestamp => iso8601(),vm_name => $vm_name}}
+				method => "notifications/message",
+				params => {
+					level => MCP_LOG_LEVEL_ERROR,
+					logger => "serencp",
+					message => $msg,
+					data => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}
+				}
 			};
 			print STDOUT encode_json($error_notification) . "\n";
 			return;
@@ -1004,11 +1026,18 @@ sub spawn_terminal_client {
 		debug("Forking to spawn terminal: $full_cmd");
 		my $pid = fork();
 		if (!defined $pid) {
-			debug("Failed to fork for terminal spawn: $!");
+			my $err = $!;
+			debug("Failed to fork for terminal spawn: $err");
+			my $msg = "Failed to fork terminal process: $err";
 			my $error_notification = {
 				jsonrpc => "2.0",
-				method => "notifications/logging/message",
-				params =>{level => MCP_LOG_LEVEL_ERROR,logger => "serencp",data => {message => "Failed to fork terminal process: $!",timestamp => iso8601(),vm_name => $vm_name}}
+				method => "notifications/message",
+				params => {
+					level => MCP_LOG_LEVEL_ERROR,
+					logger => "serencp",
+					message => $msg,
+					data => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}
+				}
 			};
 			print STDOUT encode_json($error_notification) . "\n";
 			return;
@@ -1019,13 +1048,16 @@ sub spawn_terminal_client {
 				setsid();    # Detach from terminal
 				exec($full_cmd) or do {
 					# If exec fails, we need to report back somehow
+					my $err = $!;
+					my $msg = "Terminal exec failed: $err";
 					my $error_notification = {
 						jsonrpc => "2.0",
-						method  => "notifications/logging/message",
+						method  => "notifications/message",
 						params  => {
 							level     => MCP_LOG_LEVEL_ERROR,
 							logger    => "serencp",
-							data      => {message   => "Terminal exec failed: $!",timestamp => iso8601(),vm_name   => $vm_name}
+							message   => $msg,
+							data      => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}
 						}
 					};
 					print STDOUT encode_json($error_notification) . "\n";
@@ -1034,14 +1066,20 @@ sub spawn_terminal_client {
 				};
 			};
 			if ($@) {
+				my $err = $@;
+				my $msg = "Child process error: $err";
 				my $error_notification = {
 					jsonrpc => "2.0",
-					method  => "notifications/logging/message",
-					params  =>
-						{level     => MCP_LOG_LEVEL_ERROR,logger    => "serencp",data      => {message   => "Child process error: $@",timestamp => iso8601(),vm_name   => $vm_name}}
+					method  => "notifications/message",
+					params  => {
+						level     => MCP_LOG_LEVEL_ERROR,
+						logger    => "serencp",
+						message   => $msg,
+						data      => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}
+					}
 				};
 				print STDOUT encode_json($error_notification) . "\n";
-				debug("Child process error: $@");
+				debug("Child process error: $err");
 				exit(1);
 			}
 		} else {
@@ -1049,13 +1087,15 @@ sub spawn_terminal_client {
 			debug("Terminal spawned successfully with PID: $pid");
 			# Optional: Send success notification
 			if ($DEBUG) {
+				my $msg = "Terminal spawned for VM: $vm_name (PID: $pid)";
 				my $success_notification = {
 					jsonrpc => "2.0",
-					method => "notifications/logging/message",
+					method => "notifications/message",
 					params => {
 						level => MCP_LOG_LEVEL_INFO,
 						logger => "serencp",
-						data => {message => "Terminal spawned for VM: $vm_name (PID: $pid)",timestamp => iso8601(),vm_name => $vm_name}
+						message => $msg,
+						data => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}
 					}
 				};
 				print STDOUT encode_json($success_notification) . "\n";
@@ -1064,13 +1104,20 @@ sub spawn_terminal_client {
 		}
 	};
 	if ($@) {
-		debug("Terminal spawning failed with exception: $@");
+		my $err = $@;
+		debug("Terminal spawning failed with exception: $err");
 		# Send error notification to MCP client
 		eval {
+			my $msg = "Terminal spawning failed: $err";
 			my $error_notification = {
 				jsonrpc => "2.0",
-				method => "notifications/logging/message",
-				params => {level => MCP_LOG_LEVEL_ERROR,logger => "serencp",data => {message => "Terminal spawning failed: $@",timestamp => iso8601(),vm_name => $vm_name}}
+				method => "notifications/message",
+				params => {
+					level => MCP_LOG_LEVEL_ERROR,
+					logger => "serencp",
+					message => $msg,
+					data => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}
+				}
 			};
 			print STDOUT encode_json($error_notification) . "\n";
 		};
@@ -1079,31 +1126,38 @@ sub spawn_terminal_client {
 # Internal Unix-socket client implementation
 sub run_unix_socket_client {
 	my ($socket_path) = @_;
-	my $sock = IO::Socket::UNIX->new(Type => SOCK_STREAM,Peer => $socket_path);
-	unless ($sock) {
-		print STDERR "Cannot connect to $socket_path: $!\n";
-		exit 1;
-	}
-	my $sel = IO::Select->new();
-	$sel->add(\*STDIN);
-	$sel->add($sock);
 	while (1) {
-		for my $fh ($sel->can_read) {
-			my $buf;
-			my $n = sysread($fh, $buf, 4096);
-			if (!defined($n)) {
-				print STDERR "Error reading from file handle: $!\n";
-				exit 1;
-			}
-			if ($n == 0) {
-				print STDERR "Connection closed by peer\n";
-				exit 0;
-			}
-			if ($fh == \*STDIN) {
-				syswrite($sock, $buf);
-			}else {
-				syswrite(STDOUT, $buf);
+		my $sock = IO::Socket::UNIX->new(Type => SOCK_STREAM,Peer => $socket_path);
+		unless ($sock) {
+			print STDERR "Cannot connect to $socket_path: $!. Retrying in 1s...\n";
+			sleep 1;
+			next;
+		}
+		my $sel = IO::Select->new();
+		$sel->add(\*STDIN);
+		$sel->add($sock);
+		my $connected = 1;
+		while ($connected) {
+			for my $fh ($sel->can_read) {
+				my $buf;
+				my $n = sysread($fh, $buf, 4096);
+				if (!defined($n)) {
+					print STDERR "Error reading from file handle: $!\n";
+					$connected = 0;
+					last;
+				}
+				if ($n == 0) {
+					print STDERR "Connection closed by peer. Reconnecting...\n";
+					$connected = 0;
+					last;
+				}
+				if ($fh == \*STDIN) {
+					syswrite($sock, $buf);
+				}else {
+					syswrite(STDOUT, $buf);
+				}
 			}
 		}
+		$sock->close();
 	}
 }
