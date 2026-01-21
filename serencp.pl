@@ -69,6 +69,7 @@ if ($^O !~ /^(linux|darwin|freebsd|openbsd|netbsd|solaris|aix|cygwin|dragonfly|m
 # Global state
 our %bridges;
 our $running = 1;
+our $PARENT_PID = $$;
 # Main MCP select - handles only STDIN for JSON-RPC requests
 my $mcp_select = IO::Select->new(\*STDIN);
 # Terminal detection and spawning helpers
@@ -145,16 +146,34 @@ my %TOOLS = (
 );
 # Run MCP server
 start_mcp_server() unless caller;
+# Helper for ISO8601 timestamps
+sub iso8601 {
+	return strftime("%Y-%m-%dT%H:%M:%SZ", gmtime);
+}
 # Debug output function
 sub debug {
 	my ($message) = @_;
 	return unless $DEBUG;
+
+	# Only the parent process should send notifications to STDOUT
+	if ($$ != $PARENT_PID) {
+		# In child processes, send to STDERR to avoid corrupting MCP STDOUT
+		printf STDERR "[DEBUG %d] %s\n", $$, $message;
+		return;
+	}
+
 	my $log_entry = {
 		jsonrpc => "2.0",
-		method  => "notifications/message",
-		params  => {level  => MCP_LOG_LEVEL_DEBUG,logger => "serencp",data   => {message   => $message,timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime)}}
+		method  => "notifications/logging/message",
+		params  => {
+			level  => MCP_LOG_LEVEL_DEBUG,
+			logger => "serencp",
+			data   => $message
+		}
 	};
-	print STDERR encode_json($log_entry) . "\n";
+	# Send to STDOUT for MCP clients to see.
+	# Using $|=1 (autoflush) which is already set.
+	print STDOUT encode_json($log_entry) . "\n";
 }
 # Send VM output notification automatically
 sub send_json_notification {
@@ -168,10 +187,24 @@ sub send_json_notification {
 	my $chunk_copy = decode_utf8($chunk);
 	# PTY is now in raw binary mode, so $chunk_copy contains raw bytes
 	# Decode to proper UTF-8 string for JSON
+
+	# 1. Standard MCP tool_stream notification
 	my $notification
 		= {jsonrpc => "2.0",method  => "notifications/tool_stream",params  => {toolName => "serencp/$vm_name",content  => [ { type => "text", text => $chunk_copy } ],isError  => JSON::PP::false}};
-	my $notification_json = encode_json($notification);
-	print STDOUT $notification_json . "\n";
+	print STDOUT encode_json($notification) . "\n";
+
+	# 2. Standard MCP logging notification for better client compatibility
+	my $log_notification = {
+		jsonrpc => "2.0",
+		method  => "notifications/logging/message",
+		params  => {
+			level  => MCP_LOG_LEVEL_INFO,
+			logger => "vm/$vm_name",
+			data   => $chunk_copy
+		}
+	};
+	print STDOUT encode_json($log_notification) . "\n";
+
 	debug("Sent VM output notification for $vm_name ($stream): " . length($chunk) . " bytes");
 }
 # Send progress notification
@@ -586,9 +619,10 @@ sub start_bridge {
 		sleep(0.5);
 		# Spawn terminal client for immediate interaction
 		debug("Spawning terminal client for immediate interaction");
-		spawn_terminal_client($vm_name, $socket_path);
+		my $term_pid = spawn_terminal_client($vm_name, $socket_path);
+		$bridges{$vm_name}->{terminal_pid} = $term_pid;
 		debug("Manual connection available: Connect to Unix socket at /tmp/serial_${vm_name}");
-		return {success => 1,message => "Bridge started for VM: $vm_name",port => $port,socket => $socket_path,session_id => $session_id};
+		return {success => 1,message => "Bridge started for VM: $vm_name",port => $port,socket => $socket_path,session_id => $session_id, terminal_pid => $term_pid};
 	}else {
 		debug("Parent process: Bridge setup failed - cleaning up");
 		# Clean up on failure
@@ -712,6 +746,9 @@ sub stop_bridge {
 	# Kill child processes robustly
 	if ($bridge->{pid}) {
 		terminate_process($bridge->{pid}, "bridge child process for VM $vm_name");
+	}
+	if ($bridge->{terminal_pid}) {
+		terminate_process($bridge->{terminal_pid}, "terminal window for VM $vm_name");
 	}
 	# Close handles
 	if ($bridge->{pty}) {
@@ -874,13 +911,13 @@ sub spawn_terminal_client {
 			# Send error notification to MCP client
 			my $error_notification = {
 				jsonrpc => "2.0",
-				method => "notifications/message",
+				method => "notifications/logging/message",
 				params => {
 					level => MCP_LOG_LEVEL_ERROR,
 					logger => "serencp",
 					data => {
 						message => "Terminal spawning failed: No compatible terminal emulator found. Please install one of: gnome-terminal, konsole, xterm, or Terminal.app (macOS)",
-						timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),
+						timestamp => iso8601(),
 						vm_name => $vm_name,
 						suggestion => "Manual connection: Connect to Unix socket at /tmp/serial_${vm_name}"
 					}
@@ -905,11 +942,11 @@ sub spawn_terminal_client {
 				debug("No valid shell detected");
 				my $error_notification = {
 					jsonrpc => "2.0",
-					method => "notifications/message",
+					method => "notifications/logging/message",
 					params => {
 						level => MCP_LOG_LEVEL_ERROR,
 						logger => "serencp",
-						data => {message => "Shell detection failed: No valid POSIX shell found",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}
+						data => {message => "Shell detection failed: No valid POSIX shell found",timestamp => iso8601(),vm_name => $vm_name}
 					}
 				};
 				print STDOUT encode_json($error_notification) . "\n";
@@ -956,9 +993,9 @@ sub spawn_terminal_client {
 			debug("Terminal command construction failed: $@");
 			my $error_notification = {
 				jsonrpc => "2.0",
-				method => "notifications/message",
+				method => "notifications/logging/message",
 				params =>
-					{level => MCP_LOG_LEVEL_ERROR,logger => "serencp",data => {message => "Terminal command construction failed: $@",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}}
+					{level => MCP_LOG_LEVEL_ERROR,logger => "serencp",data => {message => "Terminal command construction failed: $@",timestamp => iso8601(),vm_name => $vm_name}}
 			};
 			print STDOUT encode_json($error_notification) . "\n";
 			return;
@@ -970,8 +1007,8 @@ sub spawn_terminal_client {
 			debug("Failed to fork for terminal spawn: $!");
 			my $error_notification = {
 				jsonrpc => "2.0",
-				method => "notifications/message",
-				params =>{level => MCP_LOG_LEVEL_ERROR,logger => "serencp",data => {message => "Failed to fork terminal process: $!",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}}
+				method => "notifications/logging/message",
+				params =>{level => MCP_LOG_LEVEL_ERROR,logger => "serencp",data => {message => "Failed to fork terminal process: $!",timestamp => iso8601(),vm_name => $vm_name}}
 			};
 			print STDOUT encode_json($error_notification) . "\n";
 			return;
@@ -984,11 +1021,11 @@ sub spawn_terminal_client {
 					# If exec fails, we need to report back somehow
 					my $error_notification = {
 						jsonrpc => "2.0",
-						method  => "notifications/message",
+						method  => "notifications/logging/message",
 						params  => {
 							level     => MCP_LOG_LEVEL_ERROR,
 							logger    => "serencp",
-							data      => {message   => "Terminal exec failed: $!",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name   => $vm_name}
+							data      => {message   => "Terminal exec failed: $!",timestamp => iso8601(),vm_name   => $vm_name}
 						}
 					};
 					print STDOUT encode_json($error_notification) . "\n";
@@ -999,9 +1036,9 @@ sub spawn_terminal_client {
 			if ($@) {
 				my $error_notification = {
 					jsonrpc => "2.0",
-					method  => "notifications/message",
+					method  => "notifications/logging/message",
 					params  =>
-						{level     => MCP_LOG_LEVEL_ERROR,logger    => "serencp",data      => {message   => "Child process error: $@",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name   => $vm_name}}
+						{level     => MCP_LOG_LEVEL_ERROR,logger    => "serencp",data      => {message   => "Child process error: $@",timestamp => iso8601(),vm_name   => $vm_name}}
 				};
 				print STDOUT encode_json($error_notification) . "\n";
 				debug("Child process error: $@");
@@ -1014,15 +1051,16 @@ sub spawn_terminal_client {
 			if ($DEBUG) {
 				my $success_notification = {
 					jsonrpc => "2.0",
-					method => "notifications/message",
+					method => "notifications/logging/message",
 					params => {
 						level => MCP_LOG_LEVEL_INFO,
 						logger => "serencp",
-						data => {message => "Terminal spawned for VM: $vm_name (PID: $pid)",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}
+						data => {message => "Terminal spawned for VM: $vm_name (PID: $pid)",timestamp => iso8601(),vm_name => $vm_name}
 					}
 				};
 				print STDOUT encode_json($success_notification) . "\n";
 			}
+			return $pid;
 		}
 	};
 	if ($@) {
@@ -1031,8 +1069,8 @@ sub spawn_terminal_client {
 		eval {
 			my $error_notification = {
 				jsonrpc => "2.0",
-				method => "notifications/message",
-				params => {level => MCP_LOG_LEVEL_ERROR,logger => "serencp",data => {message => "Terminal spawning failed: $@",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name => $vm_name}}
+				method => "notifications/logging/message",
+				params => {level => MCP_LOG_LEVEL_ERROR,logger => "serencp",data => {message => "Terminal spawning failed: $@",timestamp => iso8601(),vm_name => $vm_name}}
 			};
 			print STDOUT encode_json($error_notification) . "\n";
 		};

@@ -175,21 +175,17 @@ client.on('notification', (notification) => {
 - **Timestamped**: Each chunk includes precise timing information
 - **Backward Compatible**: Existing `read` tool continues to work for pull-based access
 
-### `notifications/message`
-The server sends all log messages for errors, warnings, debug info (if enabled), and VM output using the standardized MCP logging notification.
+### `notifications/logging/message`
+The server sends all log messages for errors, warnings, debug info (if enabled), and VM output using the standardized MCP logging notification. This is the preferred way for clients to receive live updates.
 
 ```json
 {
     "jsonrpc": "2.0",
-    "method": "notifications/message",
+    "method": "notifications/logging/message",
     "params": {
-        "level": "error", // or "info", "debug"
-        "logger": "serencp", // or "vm" for VM output
-        "data": {
-            "message": "Description of the event",
-            "timestamp": "2026-01-01T08:45:23.000Z",
-            "vm_name": "vm1" // Optional, if related to a specific VM
-        }
+        "level": "info", // or "error", "debug"
+        "logger": "serencp", // or "vm/vm1" for VM output
+        "data": "Description of the event or raw VM output"
     }
 }
 ```
@@ -198,9 +194,9 @@ The server sends all log messages for errors, warnings, debug info (if enabled),
 
 ### 1. `start`
 Starts the bridge for a specific VM. If a bridge already exists, it is restarted to ensure a **clean slate**.
-**New behavior**: Automatically spawns a graphical terminal window linked to the session using the internal client of `serencp.pl`.
+**New behavior**: Automatically spawns a graphical terminal window linked to the session using the internal client of `serencp.pl`. The PID of this terminal is stored to avoid duplicate windows.
 - **Arguments**: `{"vm_name": "string", "port": "number"}` (port is optional, default: 4555)
-- **Returns**: `{"success": true, "message": "...", "port": 4555, "socket": "/tmp/...", "session_id": "session_..."}`
+- **Returns**: `{"success": true, "message": "...", "port": 4555, "socket": "/tmp/...", "session_id": "session_...", "terminal_pid": 1234}`
 - **Example**: `tools/call {"name": "start", "arguments": {"vm_name": "MYVM", "port": 4555}}`
 
 ### 2. `status`
