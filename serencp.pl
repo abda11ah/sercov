@@ -154,24 +154,13 @@ sub iso8601 {
 sub debug {
 	my ($message) = @_;
 	return unless $DEBUG;
-
 	# Only the parent process should send notifications to STDOUT
 	if ($$ != $PARENT_PID) {
 		# In child processes, send to STDERR to avoid corrupting MCP STDOUT
 		printf STDERR "[DEBUG %d] %s\n", $$, $message;
 		return;
 	}
-
-	my $log_entry = {
-		jsonrpc => "2.0",
-		method  => "notifications/message",
-		params  => {
-			level  => MCP_LOG_LEVEL_DEBUG,
-			logger => "serencp",
-			message => $message,
-			data   => $message || {}
-		}
-	};
+	my $log_entry = {jsonrpc => "2.0",method  => "notifications/message",params  => {level  => MCP_LOG_LEVEL_DEBUG,logger => "serencp",message => $message,data   => $message || {}}};
 	# Send to STDOUT for MCP clients to see.
 	# Using $|=1 (autoflush) which is already set.
 	print STDOUT encode_json($log_entry) . "\n";
@@ -183,30 +172,20 @@ sub send_json_notification {
 	# This provides automatic VM output streaming when bridge is active
 	my $bridge = $bridges{$vm_name};
 	return unless $bridge;
-	# Fix UTF-8 encoding: the chunk from PTY contains raw UTF-8 bytes
-	# but Perl treats them as Latin-1. We need to decode them properly.
-	my $chunk_copy = decode_utf8($chunk);
-	# PTY is now in raw binary mode, so $chunk_copy contains raw bytes
-	# Decode to proper UTF-8 string for JSON
-
-	# 1. Standard MCP tool_stream notification
+	# Keep raw binary mode - don't decode UTF-8, pass through all characters as-is
+	my $chunk_copy = $chunk;
+	# PTY is in raw binary mode, so $chunk_copy contains raw bytes
+	# Use notifications/tool_stream for MCP compatibility
 	my $notification
 		= {jsonrpc => "2.0",method  => "notifications/tool_stream",params  => {toolName => "serencp/$vm_name",content  => [ { type => "text", text => $chunk_copy } ],isError  => JSON::PP::false}};
 	print STDOUT encode_json($notification) . "\n";
-
-	# 2. Standard MCP logging notification for better client compatibility
+	# Use notifications/message for better client compatibility
 	my $log_notification = {
 		jsonrpc => "2.0",
 		method  => "notifications/message",
-		params  => {
-			level  => MCP_LOG_LEVEL_INFO,
-			logger => "vm/$vm_name",
-			message => $chunk_copy,
-			data   => $chunk_copy
-		}
+		params  => {level  => MCP_LOG_LEVEL_INFO,logger => "serencp",message => $chunk_copy,data   => { vm_name => $vm_name, output => $chunk_copy }}
 	};
 	print STDOUT encode_json($log_notification) . "\n";
-
 	debug("Sent VM output notification for $vm_name ($stream): " . length($chunk) . " bytes");
 }
 # Send progress notification
@@ -413,27 +392,49 @@ sub tool_status {
 		}
 	};
 }
-# Tool: Read from VM serial console (legacy - most output now comes via real-time notifications)
+# Tool: Read from VM serial console (now reads from output socket directly)
 sub tool_read {
 	my ($params) = @_;
 	# Normalize parameter keys to lowercase
 	$params = { map { lc($_) => $params->{$_} } keys %$params };
 	my $vm_name  = $params->{vm_name};
-	debug("Legacy read request for VM: $vm_name");
+	debug("Read request for VM: $vm_name");
 	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_INVALID_PARAMS,message => "vm_name parameter is required"}} unless $vm_name;
 	return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_RESOURCE_NOT_FOUND,message => "Bridge not running for VM: $vm_name. Use start to start it."}} unless bridge_exists($vm_name);
 	return do {
 		my $bridge = $bridges{$vm_name};
-		# Return current buffer content for backward compatibility
-		my @lines  = @{ $bridge->{buffer} };
-		debug("VM buffer has " . scalar(@lines) . " lines");
-		# Always return last $CONSOLE_HISTORY_LINES lines (or fewer if buffer is smaller)
-		my $return_lines = $CONSOLE_HISTORY_LINES;
-		$return_lines = $RING_BUFFER_SIZE if $RING_BUFFER_SIZE < $return_lines;
-		my $start = @lines > $return_lines ? @lines - $return_lines : 0;
-		my $output = join("\n", @lines[ $start .. $#lines ]);
-		debug("Legacy read returning VM output: " . length($output) . " characters");
-		{ success => 1, output => $output };
+		debug("Reading from output socket for VM: $vm_name");
+		# Connect to output socket and read available data
+		my $socket_path = "/tmp/serial_${vm_name}.out";
+		my $socket = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $socket_path);
+		unless ($socket) {
+			debug("Failed to connect to output socket $socket_path: $!");
+			return { success => 0, output => "" };
+		}
+		$socket->blocking(0);
+		my $buffer = "";
+		my $total_bytes = 0;
+		# Read available data with timeout
+		my $start_time = time();
+		while (time() - $start_time < 2) {  # 2 second timeout
+			my $data;
+			my $bytes = sysread($socket, $data, 4096);
+			if (!defined $bytes) {
+				last if $!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK};
+				debug("Error reading from output socket: $!");
+				last;
+			} elsif ($bytes == 0) {
+				last;  # EOF
+			} elsif ($bytes > 0) {
+				$buffer .= $data;
+				$total_bytes += $bytes;
+				debug("Read $bytes bytes from output socket (total: $total_bytes)");
+			}
+			sleep(0.01);  # Small delay to prevent spinning
+		}
+		$socket->close();
+		debug("Read completed: $total_bytes bytes from VM output");
+		{ success => 1, output => $buffer };
 	};
 }
 # Tool: Write to VM serial console
@@ -449,14 +450,14 @@ sub tool_write {
 	my $result = do {
 		my $bridge = $bridges{$vm_name};
 		debug("Writing to VM: $vm_name text: '$text'");
-		return 0 unless $bridge && $bridge->{pty};
+		return 0 unless $bridge && $bridge->{pty_in};
 		# Remove all trailing newlines, then add exactly one
 		$text =~ s/\n+$//;
 		$text .= "\n";
-		debug("Writing to PTY: " . length($text) . " bytes");
-		# Write to PTY
-		my $bytes = syswrite($bridge->{pty}, $text);
-		debug("PTY write result: $bytes bytes");
+		debug("Writing to input PTY: " . length($text) . " bytes");
+		# Write to input PTY
+		my $bytes = syswrite($bridge->{pty_in}, $text);
+		debug("Input PTY write result: $bytes bytes");
 		$bytes > 0;
 	};
 	debug("Write result: " . ($result ? "SUCCESS" : "FAILED"));
@@ -465,21 +466,23 @@ sub tool_write {
 # Check if bridge exists for VM
 sub bridge_exists {
 	my ($vm_name) = @_;
-	return exists $bridges{$vm_name} && $bridges{$vm_name}->{pty};
+	return exists $bridges{$vm_name} && $bridges{$vm_name}->{pty_in} && $bridges{$vm_name}->{pty_out};
 }
 # Start bridge for VM
 sub start_bridge {
 	my ($vm_name, $port, $progressToken, $old_term_pid) = @_;
 	$port //= $DEFAULT_VM_PORT;
 	debug("Creating bridge for $vm_name on port $port");
-	# Create PTY
-	my $pty = IO::Pty->new();
-	unless ($pty) {
-		debug("Failed to create PTY");
-		return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_SERVER_ERROR,message => "Failed to create PTY for VM: $vm_name"}};
+	# Create two PTYs - one for input, one for output
+	my $pty_in = IO::Pty->new();
+	my $pty_out = IO::Pty->new();
+	unless ($pty_in && $pty_out) {
+		debug("Failed to create PTYs");
+		return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_SERVER_ERROR,message => "Failed to create PTYs for VM: $vm_name"}};
 	}
-	binmode($pty, ':raw');
-	debug("PTY created successfully");
+	$pty_in->set_raw();
+	$pty_out->set_raw();
+	debug("PTYs created successfully (input and output)");
 	# Create a pipe for child to signal readiness
 	my ($read_pipe, $write_pipe);
 	unless (pipe($read_pipe, $write_pipe)) {
@@ -495,18 +498,26 @@ sub start_bridge {
 	if ($pid == 0) {
 		# Child process - handle the bridge
 		close($read_pipe);    # Child doesn't need read end
-		 # Don't close PTY - keep slave end for communication
-		my $pty_slave = $pty->slave();
-		$pty->close();        # Close master end in child
+		 # Don't close PTYs - keep slave ends for communication
+		my $pty_in_slave = $pty_in->slave();
+		my $pty_out_slave = $pty_out->slave();
+		$pty_in->close();        # Close master end in child
+		$pty_out->close();       # Close master end in child
 		 # Disable PTY line discipline echo to prevent character duplication
 		 # This prevents the PTY from echoing characters back to the VM
 		my $termios = POSIX::Termios->new();
-		my $pty_slave_fd = fileno($pty_slave);
-		$termios->getattr($pty_slave_fd);
+		my $pty_in_slave_fd = fileno($pty_in_slave);
+		my $pty_out_slave_fd = fileno($pty_out_slave);
+		$termios->getattr($pty_in_slave_fd);
 		my $lflag = $termios->getlflag();
 		$lflag &= ~(ECHO | ECHOK | ECHOE | ICANON);  # Disable echo and canonical mode
 		$termios->setlflag($lflag);
-		$termios->setattr($pty_slave_fd, TCSANOW);
+		$termios->setattr($pty_in_slave_fd, TCSANOW);
+		$termios->getattr($pty_out_slave_fd);
+		$lflag = $termios->getlflag();
+		$lflag &= ~(ECHO | ECHOK | ECHOE | ICANON);  # Disable echo and canonical mode
+		$termios->setlflag($lflag);
+		$termios->setattr($pty_out_slave_fd, TCSANOW);
 		# Try to connect to VM serial console (raw TCP) with retry
 		debug("Child process: Attempting to connect to VM serial console on port $port");
 		my $vm_socket;
@@ -526,9 +537,9 @@ sub start_bridge {
 			debug("Child process: Signaling parent - READY");
 			print $write_pipe "READY\n";
 			close($write_pipe);
-			# Continue with bridge process - pass PTY slave
+			# Continue with bridge process - pass PTY slaves
 			debug("Child process: Starting bridge process child");
-			bridge_process_child($vm_socket, $pty_slave);
+			bridge_process_child($vm_socket, $pty_in_slave, $pty_out_slave);
 			exit(0);
 		}else {
 			debug("Child process: Failed to connect to VM serial console after $max_retries attempts: $!");
@@ -540,22 +551,27 @@ sub start_bridge {
 	}
 	# Parent process - wait for child to be ready
 	close($write_pipe);    # Parent doesn't need write end
-	 # Create socket
-	my $socket_path = "/tmp/serial_${vm_name}";
-	debug("Parent process: Creating Unix socket at $socket_path");
-	unlink $socket_path if -e $socket_path;
-	my $socket = IO::Socket::UNIX->new(Type  => SOCK_STREAM,Local => $socket_path,Listen => 1);
-	unless ($socket) {
-		debug("Failed to create socket: $!");
+	 # Create two sockets - one for input, one for output
+	my $socket_in_path = "/tmp/serial_${vm_name}.in";
+	my $socket_out_path = "/tmp/serial_${vm_name}.out";
+	debug("Parent process: Creating Unix sockets at $socket_in_path and $socket_out_path");
+	unlink $socket_in_path if -e $socket_in_path;
+	unlink $socket_out_path if -e $socket_out_path;
+	my $socket_in = IO::Socket::UNIX->new(Type  => SOCK_STREAM,Local => $socket_in_path,Listen => 1);
+	my $socket_out = IO::Socket::UNIX->new(Type  => SOCK_STREAM,Local => $socket_out_path,Listen => 1);
+	unless ($socket_in && $socket_out) {
+		debug("Failed to create sockets: $!");
 		terminate_process($pid, "bridge child process for VM $vm_name (socket creation failed)") if $pid;
-		$pty->close();
-		return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_SERVER_ERROR,message => "Failed to create Unix socket for VM: $vm_name :".$!}};
+		$pty_in->close();
+		$pty_out->close();
+		return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_SERVER_ERROR,message => "Failed to create Unix sockets for VM: $vm_name :".$!}};
 	}
-	debug("Parent process: Unix socket created successfully");
+	debug("Parent process: Unix sockets created successfully");
 	# Set up select - add pipe to monitor child readiness
 	my $select = IO::Select->new();
-	$select->add($pty);
-	$select->add($socket);
+	$select->add($pty_out);  # Only need to monitor output PTY for VM data
+	$select->add($socket_in);
+	$select->add($socket_out);
 	$select->add($read_pipe);
 	# Wait for child to signal readiness (with timeout)
 	my $ready      = 0;
@@ -608,16 +624,18 @@ sub start_bridge {
 		my $session_id = sprintf("session_%s_%d", $vm_name, time());
 		# Store bridge info with dedicated select for this bridge
 		$bridges{$vm_name} = {
-			pty     => $pty,
-			socket  => $socket,
+			pty_in  => $pty_in,
+			pty_out => $pty_out,
+			socket_in  => $socket_in,
+			socket_out => $socket_out,
 			port    => $port,
 			buffer  => [],
 			buffer_bytes => 0,  # Track total bytes in buffer
 			total_bytes_sent => 0,  # Track total bytes sent in notifications
 			pid     => $pid,
 			terminal_pid => $old_term_pid,
-			session => {id      => $session_id,clients => {},},
-			select  => IO::Select->new($pty, $socket),  # Dedicated select for this bridge
+			session => {id      => $session_id,clients => {},input_clients => {},},
+			select  => IO::Select->new($pty_out, $socket_in, $socket_out),  # Dedicated select for this bridge
 		};
 		# Small delay to ensure socket is fully ready before spawning clients
 		sleep(0.5);
@@ -627,40 +645,45 @@ sub start_bridge {
 			debug("Terminal already running for VM: $vm_name (PID: $term_pid)");
 		} else {
 			debug("Spawning terminal client for immediate interaction");
-			$term_pid = spawn_terminal_client($vm_name, $socket_path);
+			$term_pid = spawn_terminal_client($vm_name, $socket_in_path, $socket_out_path);
 			$bridges{$vm_name}->{terminal_pid} = $term_pid;
 		}
-		debug("Manual connection available: Connect to Unix socket at /tmp/serial_${vm_name}");
-		return {success => 1,message => "Bridge started for VM: $vm_name",port => $port,socket => $socket_path,session_id => $session_id, terminal_pid => $term_pid};
+		debug("Manual connection available: Connect to Unix sockets at /tmp/serial_${vm_name}.in and /tmp/serial_${vm_name}.out");
+		return {success => 1,message => "Bridge started for VM: $vm_name",port => $port,socket_in => $socket_in_path, socket_out => $socket_out_path,session_id => $session_id, terminal_pid => $term_pid};
 	}else {
 		debug("Parent process: Bridge setup failed - cleaning up");
 		# Clean up on failure
 		terminate_process($pid, "bridge child process for VM $vm_name (setup failed)") if $pid;
-		$pty->close();
-		$socket->close();
-		unlink $socket_path if -e $socket_path;
+		$pty_in->close();
+		$pty_out->close();
+		$socket_in->close();
+		$socket_out->close();
+		unlink $socket_in_path if -e $socket_in_path;
+		unlink $socket_out_path if -e $socket_out_path;
 		return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_SERVER_ERROR,message =>"Failed to start bridge for VM: $vm_name - connection timeout"}};
 	}
 }
 # Bridge process (child) - simplified version for child process
 sub bridge_process_child {
-	my ($vm_socket, $pty_slave) = @_;
-	debug("Bridge child: Starting data bridge between VM and PTY");
+	my ($vm_socket, $pty_in_slave, $pty_out_slave) = @_;
+	debug("Bridge child: Starting data bridge between VM and PTYs");
 	# Set both sockets to non-blocking mode immediately
 	$vm_socket->blocking(0);
-	$pty_slave->blocking(0);
-	binmode($pty_slave, ':raw');
-	# Set up select for multiplexing VM socket and PTY slave
+	$pty_in_slave->blocking(0);
+	$pty_out_slave->blocking(0);
+	$pty_in_slave->set_raw();
+	$pty_out_slave->set_raw();
+	# Set up select for multiplexing VM socket and PTY slaves
 	my $select = IO::Select->new();
 	$select->add($vm_socket);
-	$select->add($pty_slave);   # Read commands from parent via PTY
+	$select->add($pty_in_slave);   # Read commands from parent via input PTY
 	 # Main loop - non-blocking I/O with select
 	while (1) {
 		# Use IO::Select for efficient multiplexing
 		my @ready = $select->can_read(0.01);  # 10ms timeout
 		for my $fh (@ready) {
 			if ($fh == $vm_socket) {
-				# Data from VM → PTY slave → PTY master → parent
+				# Data from VM → PTY out slave → PTY out master → parent
 				my $buffer;
 				my $bytes = sysread($vm_socket, $buffer, 4096);
 				# Handle different read outcomes
@@ -676,26 +699,26 @@ sub bridge_process_child {
 					last;
 				} elsif ($bytes > 0) {
 					debug("Bridge child: Read $bytes bytes from VM");
-					# Write to PTY slave
-					syswrite($pty_slave, $buffer);
+					# Write to output PTY slave
+					syswrite($pty_out_slave, $buffer);
 				}
-			} elsif ($fh == $pty_slave) {
-				# Commands from parent PTY master → VM socket
+			} elsif ($fh == $pty_in_slave) {
+				# Commands from parent PTY in master → VM socket
 				my $buffer;
-				my $bytes = sysread($pty_slave, $buffer, 4096);
+				my $bytes = sysread($pty_in_slave, $buffer, 4096);
 				# Handle different read outcomes
 				if (!defined $bytes) {
 					# Check for temporary errors
 					next if $!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK};
 					# Actual error - break connection
-					debug("Bridge child: Error reading from PTY slave: $!");
+					debug("Bridge child: Error reading from input PTY slave: $!");
 					last;
 				} elsif ($bytes == 0) {
 					# EOF - Parent closed connection
-					debug("Bridge child: PTY slave closed connection");
+					debug("Bridge child: Input PTY slave closed connection");
 					last;
 				} elsif ($bytes > 0) {
-					debug("Bridge child: Read $bytes bytes from PTY, forwarding to VM");
+					debug("Bridge child: Read $bytes bytes from input PTY, forwarding to VM");
 					syswrite($vm_socket, $buffer);
 				}
 			}
@@ -708,7 +731,8 @@ sub bridge_process_child {
 	}
 	debug("Bridge child: Closing connections");
 	close $vm_socket;
-	close $pty_slave;
+	close $pty_in_slave;
+	close $pty_out_slave;
 }
 # Robust process termination with SIGTERM + SIGKILL fallback
 sub terminate_process {
@@ -762,13 +786,19 @@ sub stop_bridge {
 		$term_pid = undef;
 	}
 	# Close handles
-	if ($bridge->{pty}) {
-		$bridge->{pty}->close();
+	if ($bridge->{pty_in}) {
+		$bridge->{pty_in}->close();
 	}
-	$bridge->{socket}->close() if $bridge->{socket};
-	# Remove socket file
-	my $socket_path = "/tmp/serial_${vm_name}";
-	unlink $socket_path if -e $socket_path;
+	if ($bridge->{pty_out}) {
+		$bridge->{pty_out}->close();
+	}
+	$bridge->{socket_in}->close() if $bridge->{socket_in};
+	$bridge->{socket_out}->close() if $bridge->{socket_out};
+	# Remove socket files
+	my $socket_in_path = "/tmp/serial_${vm_name}.in";
+	my $socket_out_path = "/tmp/serial_${vm_name}.out";
+	unlink $socket_in_path if -e $socket_in_path;
+	unlink $socket_out_path if -e $socket_out_path;
 	# Clean up
 	delete $bridges{$vm_name};
 	return $term_pid;
@@ -778,12 +808,12 @@ sub monitor_bridge {
 	my ($vm_name, $fh) = @_;
 	my $bridge = $bridges{$vm_name};
 	return unless $bridge;
-	if ($fh == $bridge->{pty}) {
-		# VM data from PTY master → buffer + all clients
+	if ($fh == $bridge->{pty_out}) {
+		# VM data from output PTY master → buffer + output socket clients
 		my $buffer;
-		my $bytes = sysread($bridge->{pty}, $buffer, 4096);
+		my $bytes = sysread($bridge->{pty_out}, $buffer, 4096);
 		if (defined $bytes && $bytes > 0) {
-			debug("Monitor: Read $bytes bytes from VM via PTY");
+			debug("Monitor: Read $bytes bytes from VM via output PTY");
 			# Send live output notification automatically
 			send_json_notification($vm_name, "stdout", $buffer);
 			# Update buffer for read - optimized batch processing
@@ -804,35 +834,36 @@ sub monitor_bridge {
 					debug("Buffer management: removed line (" . length($removed) . " bytes) for $vm_name. Current: " . scalar(@{ $bridge->{buffer} }) . " lines, " . $bridge->{buffer_bytes} . " bytes");
 				}
 			}
-			# Forward to all connected unix socket clients
+			# Forward to all connected output socket clients
 			my $client_count = scalar keys %{ $bridge->{session}->{clients} };
-			debug("Monitor: Forwarding to $client_count clients");
+			debug("Monitor: Forwarding to $client_count output clients");
 			for my $cid (keys %{ $bridge->{session}->{clients} }) {
 				my $client = $bridge->{session}->{clients}->{$cid};
 				unless (send_to_tmp_socket($client, $buffer)) {
-					debug("Monitor: Client $cid write failed, removing.");
+					debug("Monitor: Output client $cid write failed, removing.");
 					$bridge->{select}->remove($client);
 					delete $bridge->{session}->{clients}->{$cid};
 					close $client;
 				}
 			}
 		}elsif (defined $bytes && $bytes == 0) {
-			debug("Server: PTY for $vm_name signaled EOF - VM bridge likely died");
-			# Auto-restart bridge
-			debug("VM disconnected - auto-restart bridge for $vm_name");
+			debug("Server: Output PTY for $vm_name signaled EOF - VM bridge likely died");
+			# Auto-restart bridge after a brief pause to prevent rapid cycling
+			debug("VM disconnected - attempting auto-restart bridge for $vm_name. Waiting 1 second...");
 			my $port = $bridge->{port};
 			my $term_pid = stop_bridge($vm_name, 0); # Don't kill terminal on auto-restart
+			sleep(1); # Wait briefly to prevent rapid spin loop on immediate failure
 			start_bridge($vm_name, $port, undef, $term_pid);
 		}
-	}elsif ($fh == $bridge->{socket}) {
-		# New client connection
-		my $client = $bridge->{socket}->accept();
+	}elsif ($fh == $bridge->{socket_out}) {
+		# New output client connection
+		my $client = $bridge->{socket_out}->accept();
 		if ($client) {
 			$client->blocking(0); # Ensure non-blocking
 			my $client_id = fileno($client);
 			$bridge->{session}->{clients}->{$client_id} = $client;
 			$bridge->{select}->add($client);  # Add to bridge's dedicated select
-			debug("Monitor: New client connected with ID $client_id");
+			debug("Monitor: New output client connected with ID $client_id");
 			# Send current buffer content to new client
 			if (@{ $bridge->{buffer} }) {
 				my $start
@@ -840,23 +871,46 @@ sub monitor_bridge {
 					? @{ $bridge->{buffer} } - $CONSOLE_HISTORY_LINES
 					: 0;
 				my $history = join("\n",@{ $bridge->{buffer} }[ $start .. $#{ $bridge->{buffer} } ]). "\n";
-				debug("Monitor: Sending history (" . length($history) . " bytes) to new client");
+				debug("Monitor: Sending history (" . length($history) . " bytes) to new output client");
 				send_to_tmp_socket($client, $history);
 			}
 		}
+	}elsif ($fh == $bridge->{socket_in}) {
+		# New input client connection (for writing commands)
+		my $client = $bridge->{socket_in}->accept();
+		if ($client) {
+			$client->blocking(0); # Ensure non-blocking
+			my $client_id = fileno($client);
+			# Store input clients separately to avoid confusion with output clients
+			$bridge->{session}->{input_clients}->{$client_id} = $client;
+			$bridge->{select}->add($client);  # Add to bridge's dedicated select
+			debug("Monitor: New input client connected with ID $client_id");
+		}
 	}elsif (exists $bridge->{session}->{clients}->{ fileno($fh) }) {
-		# Data from terminal window client → VM via PTY master
+		# Data from output client (read-only, just monitor)
+		my $buffer;
+		my $bytes = sysread($fh, $buffer, 4096);
+		if (defined $bytes && $bytes == 0) {
+			# Output client disconnected
+			my $client_id = fileno($fh);
+			debug("Monitor: Output client $client_id disconnected");
+			$bridge->{select}->remove($fh);  # Remove from bridge's dedicated select
+			delete $bridge->{session}->{clients}->{$client_id};
+			close $fh;
+		}
+	}elsif (exists $bridge->{session}->{input_clients}->{ fileno($fh) }) {
+		# Data from input client → VM via input PTY master
 		my $buffer;
 		my $bytes = sysread($fh, $buffer, 4096);
 		if (defined $bytes && $bytes > 0) {
-			debug("Monitor: Read $bytes bytes from client, forwarding to VM");
-			syswrite($bridge->{pty}, $buffer);
+			debug("Monitor: Read $bytes bytes from input client, forwarding to VM");
+			syswrite($bridge->{pty_in}, $buffer);
 		}else {
-			# Client disconnected
+			# Input client disconnected
 			my $client_id = fileno($fh);
-			debug("Monitor: Client $client_id disconnected");
+			debug("Monitor: Input client $client_id disconnected");
 			$bridge->{select}->remove($fh);  # Remove from bridge's dedicated select
-			delete $bridge->{session}->{clients}->{$client_id};
+			delete $bridge->{session}->{input_clients}->{$client_id};
 			close $fh;
 		}
 	}
@@ -887,7 +941,7 @@ sub cleanup {
 	exit(0);
 }
 sub spawn_terminal_client {
-	my ($vm_name, $socket_path) = @_;
+	my ($vm_name, $socket_in_path, $socket_out_path) = @_;
 	debug("Attempting to spawn terminal for VM: $vm_name");
 	eval {
 		# Terminal detection with fallback mechanism
@@ -929,12 +983,7 @@ sub spawn_terminal_client {
 					level => MCP_LOG_LEVEL_ERROR,
 					logger => "serencp",
 					message => $msg,
-					data => {
-						message => $msg,
-						timestamp => iso8601(),
-						vm_name => $vm_name,
-						suggestion => "Manual connection: Connect to Unix socket at /tmp/serial_${vm_name}"
-					}
+					data => {message => $msg,timestamp => iso8601(),vm_name => $vm_name,suggestion => "Manual connection: Connect to Unix sockets at /tmp/serial_${vm_name}.in and /tmp/serial_${vm_name}.out"}
 				}
 			};
 			print STDOUT encode_json($error_notification) . "\n";
@@ -958,12 +1007,7 @@ sub spawn_terminal_client {
 				my $error_notification = {
 					jsonrpc => "2.0",
 					method => "notifications/message",
-					params => {
-						level => MCP_LOG_LEVEL_ERROR,
-						logger => "serencp",
-						message => $msg,
-						data => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}
-					}
+					params => {level => MCP_LOG_LEVEL_ERROR,logger => "serencp",message => $msg,data => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}}
 				};
 				print STDOUT encode_json($error_notification) . "\n";
 				return;
@@ -971,8 +1015,8 @@ sub spawn_terminal_client {
 		};
 		my $shell_name = (split '/', $shell)[-1]; # Get shell basename (e.g., 'zsh', 'bash')
 		debug("Detected shell: $shell ($shell_name)");
-		# Relaunch this script in internal client mode
-		my $cmd = "$^X $0 --socket=$socket_path";
+		# Relaunch this script in internal client mode for two-socket operation
+		my $cmd = "$^X $0 --socket=$socket_out_path";
 		debug("Terminal command target: $cmd");
 		# Build terminal command with robust error handling
 		my $full_cmd;
@@ -1012,12 +1056,7 @@ sub spawn_terminal_client {
 			my $error_notification = {
 				jsonrpc => "2.0",
 				method => "notifications/message",
-				params => {
-					level => MCP_LOG_LEVEL_ERROR,
-					logger => "serencp",
-					message => $msg,
-					data => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}
-				}
+				params => {level => MCP_LOG_LEVEL_ERROR,logger => "serencp",message => $msg,data => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}}
 			};
 			print STDOUT encode_json($error_notification) . "\n";
 			return;
@@ -1032,12 +1071,7 @@ sub spawn_terminal_client {
 			my $error_notification = {
 				jsonrpc => "2.0",
 				method => "notifications/message",
-				params => {
-					level => MCP_LOG_LEVEL_ERROR,
-					logger => "serencp",
-					message => $msg,
-					data => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}
-				}
+				params => {level => MCP_LOG_LEVEL_ERROR,logger => "serencp",message => $msg,data => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}}
 			};
 			print STDOUT encode_json($error_notification) . "\n";
 			return;
@@ -1053,12 +1087,7 @@ sub spawn_terminal_client {
 					my $error_notification = {
 						jsonrpc => "2.0",
 						method  => "notifications/message",
-						params  => {
-							level     => MCP_LOG_LEVEL_ERROR,
-							logger    => "serencp",
-							message   => $msg,
-							data      => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}
-						}
+						params  => {level     => MCP_LOG_LEVEL_ERROR,logger    => "serencp",message   => $msg,data      => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}}
 					};
 					print STDOUT encode_json($error_notification) . "\n";
 					debug("Terminal exec failed: $!");
@@ -1071,12 +1100,7 @@ sub spawn_terminal_client {
 				my $error_notification = {
 					jsonrpc => "2.0",
 					method  => "notifications/message",
-					params  => {
-						level     => MCP_LOG_LEVEL_ERROR,
-						logger    => "serencp",
-						message   => $msg,
-						data      => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}
-					}
+					params  => {level     => MCP_LOG_LEVEL_ERROR,logger    => "serencp",message   => $msg,data      => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}}
 				};
 				print STDOUT encode_json($error_notification) . "\n";
 				debug("Child process error: $err");
@@ -1091,12 +1115,7 @@ sub spawn_terminal_client {
 				my $success_notification = {
 					jsonrpc => "2.0",
 					method => "notifications/message",
-					params => {
-						level => MCP_LOG_LEVEL_INFO,
-						logger => "serencp",
-						message => $msg,
-						data => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}
-					}
+					params => {level => MCP_LOG_LEVEL_INFO,logger => "serencp",message => $msg,data => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}}
 				};
 				print STDOUT encode_json($success_notification) . "\n";
 			}
@@ -1112,30 +1131,46 @@ sub spawn_terminal_client {
 			my $error_notification = {
 				jsonrpc => "2.0",
 				method => "notifications/message",
-				params => {
-					level => MCP_LOG_LEVEL_ERROR,
-					logger => "serencp",
-					message => $msg,
-					data => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}
-				}
+				params => {level => MCP_LOG_LEVEL_ERROR,logger => "serencp",message => $msg,data => {message => $msg, timestamp => iso8601(), vm_name => $vm_name}}
 			};
 			print STDOUT encode_json($error_notification) . "\n";
 		};
 	}
 }
-# Internal Unix-socket client implementation
+# Internal Unix-socket client implementation for two-socket mode
 sub run_unix_socket_client {
 	my ($socket_path) = @_;
+	# Derive input socket path from output socket path
+	my $socket_out_path = $socket_path;
+	my $socket_in_path = $socket_out_path;
+	$socket_in_path =~ s/\.out$/.in/;
+	# Exponential backoff configuration for client connection
+	my $base_delay  = 0.5; # Initial delay in seconds
+	my $max_delay   = 16;  # Max delay in seconds
+	my $retry_count = 0;
 	while (1) {
-		my $sock = IO::Socket::UNIX->new(Type => SOCK_STREAM,Peer => $socket_path);
-		unless ($sock) {
-			print STDERR "Cannot connect to $socket_path: $!. Retrying in 1s...\n";
-			sleep 1;
+		# Calculate exponential backoff delay, capped at $max_delay
+		my $delay = $base_delay * (2 ** $retry_count);
+		$delay = $max_delay if $delay > $max_delay;
+		# Connect to both sockets with a connection timeout
+		# The timeout is set to the calculated delay, but maxed at 5 seconds for a single attempt.
+		my $timeout = $delay < 5 ? $delay : 5;
+		my $sock_in = IO::Socket::UNIX->new(Type => SOCK_STREAM,Peer => $socket_in_path,Timeout => $timeout);
+		my $sock_out = IO::Socket::UNIX->new(Type => SOCK_STREAM,Peer => $socket_out_path,Timeout => $timeout);
+		unless (defined $sock_in && defined $sock_out) {
+			print STDERR "Cannot connect to sockets: in=$socket_in_path, out=$socket_out_path. Error: $!. Retrying in $delay seconds (attempt $retry_count)...\n";
+			$retry_count++;
+			sleep $delay;
 			next;
 		}
+		# Successful connection
+		$retry_count = 0;
+		# Use raw binary mode for all characters
+		binmode(STDIN, ':raw');
+		binmode(STDOUT, ':raw');
 		my $sel = IO::Select->new();
 		$sel->add(\*STDIN);
-		$sel->add($sock);
+		$sel->add($sock_out);
 		my $connected = 1;
 		while ($connected) {
 			for my $fh ($sel->can_read) {
@@ -1152,12 +1187,15 @@ sub run_unix_socket_client {
 					last;
 				}
 				if ($fh == \*STDIN) {
-					syswrite($sock, $buf);
+					# Write to input socket
+					syswrite($sock_in, $buf);
 				}else {
+					# Read from output socket and write to STDOUT
 					syswrite(STDOUT, $buf);
 				}
 			}
 		}
-		$sock->close();
+		$sock_in->close();
+		$sock_out->close();
 	}
 }
