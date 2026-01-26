@@ -12,7 +12,7 @@ It uses `IO::Pty` to create a pseudo-terminal (PTY) for the VM serial console. I
 - **Persistent PTY**: Maintains a stable connection to the VM serial console.
 - **Auto-Restart**: Automatically detects VM disconnects and restarts the bridge for persistent interaction.
 - **Ring Buffer**: Maintains a ring buffer of the last 1000 lines of output (10MB max per VM).
-- **Multi-Client Access**: Supports multiple simultaneous clients via a Unix socket at `/tmp/serial_${VM_NAME}`.
+- **Multi-Client Access**: Supports multiple simultaneous clients via dedicated Unix sockets for input (`/tmp/serial_${VM_NAME}.in`) and output (`/tmp/serial_${VM_NAME}.out`).
 - **Standard MCP**: Supports standard `tools/list` and `tools/call` methods for tool discovery and execution.
 - **Zombie Management**: Built-in process reaper prevents zombie processes from forks.
 
@@ -58,7 +58,7 @@ The script will automatically detect which terminal is available on your system 
 - **Ring Buffer Size**: 1000 lines
 - **Max Buffer Bytes**: 10MB per VM
 - **Console History Lines**: 60 lines (sent to new clients)
-- **Read Timeout**: 10 seconds (for read tool)
+- **Read Timeout**: 2 seconds (internal, for legacy `read` tool)
 
 ### MCP Server Configuration
 Make sure the MCP server is configured in `opencode.jsonc`:
@@ -197,7 +197,7 @@ The server sends all log messages for errors, warnings, debug info (if enabled),
 Starts the bridge for a specific VM. If a bridge already exists, it is restarted to ensure a **clean slate**.
 **New behavior**: Automatically spawns a graphical terminal window linked to the session using the internal client of `serencp.pl`. The PID of this terminal is stored to avoid duplicate windows.
 - **Arguments**: `{"vm_name": "string", "port": "number"}` (port is optional, default: 4555)
-- **Returns**: `{"success": true, "message": "...", "port": 4555, "socket": "/tmp/...", "session_id": "session_...", "terminal_pid": 1234}`
+- **Returns**: `{"success": true, "message": "...", "port": 4555, "socket_in": "/tmp/serial_VM_NAME.in", "socket_out": "/tmp/serial_VM_NAME.out", "session_id": "session_...", "terminal_pid": 1234}`
 - **Example**: `tools/call {"name": "start", "arguments": {"vm_name": "MYVM", "port": 4555}}`
 
 ### 2. `status`
@@ -206,26 +206,30 @@ Checks the status of the bridge.
 - **Returns**: `{"running": true/false, "vm_name": "...", "port": ..., "buffer_size": ...}`
 
 ### 3. `read`
-Reads output from VM serial console with a 10-second timeout. Returns the last 60 lines from the ring buffer.
+Reads all available output from the VM serial console's dedicated output Unix socket with a 2-second timeout. This is for pull-based legacy access.
 - **Arguments**: `{"vm_name": "string"}`
 - **Returns**: `{"success": true, "output": "..."}`
 
 ### 4. `write`
-Sends a command to the VM serial console.
+Sends a command to the VM serial console via its dedicated input Unix socket.
+
 - **Arguments**: `{"vm_name": "string", "text": "command"}`
+- **Returns**: `{"success": true/false, "message": "..."}`
+- **Example**: `tools/call {"name": "write", "arguments": {"vm_name": "MYVM", "text": "ls -l /"}}`
 
 ### 5. `stop`
-Stops the bridge for a specific VM.
+Stops the bridge for a specific VM, cleaning up all PTYs, child processes, and temporary Unix sockets.
 - **Arguments**: `{"vm_name": "string"}`
+- **Returns**: `{"success": true/false, "message": "..."}`
 
 ## Architecture
 
-The script connects to the VM serial console as a client and provides a Unix socket server at `/tmp/serial_VM_NAME`. It supports both an internal Unix socket client mode and automatic terminal spawning. The MCP server handles JSON-RPC commands and replies via MCP-compliant notifications.
+The script connects to the VM serial console as a client and provides two Unix socket servers: one for input at `/tmp/serial_${VM_NAME}.in` and one for output at `/tmp/serial_${VM_NAME}.out`. It supports both an internal Unix socket client mode and automatic terminal spawning. The MCP server handles JSON-RPC commands and replies via MCP-compliant notifications.
 
 ### Internal Unix Socket Client Mode
 The script can be run in client mode to connect to an existing bridge:
 ```bash
-./serencp.pl --socket=/tmp/serial_VM_NAME
+./serencp.pl --socket=/tmp/serial_${VM_NAME}.out
 ```
 
 This mode provides direct terminal access to the VM serial console through the Unix socket interface.
@@ -237,8 +241,9 @@ graph TD
     PTY["Pseudo-Terminal (PTY Master)"]
     MCP["serencp MCP Server (Main Event Loop)"]
     Client["MCP Client (LLM / Opencode)"]
-    UnixSocket["Unix Socket (/tmp/serial_VM_NAME)"]
-    ScriptClient["serencp.pl --socket=/tmp/serial_VM_NAME"]
+    UnixIn["Unix Input Socket (/tmp/serial_VM_NAME.in)"]
+    UnixOut["Unix Output Socket (/tmp/serial_VM_NAME.out)"]
+    ScriptClient["serencp.pl --socket=/tmp/serial_VM_NAME.out"]
     ExtClients["External Clients (optional)"]
     LiveTerminal["Live Terminal View (Auto-Spawned)"]
 
@@ -246,17 +251,21 @@ graph TD
     Bridge <--> PTY
     PTY <--> MCP
     MCP <--> Client
-    MCP <--> UnixSocket
-    UnixSocket <--> ScriptClient
-    UnixSocket <--> LiveTerminal
-    UnixSocket -.-> ExtClients
+    MCP -.-> UnixIn
+    MCP -.-> UnixOut
+    UnixOut <--> ScriptClient
+    UnixOut <--> LiveTerminal
+    UnixOut -.-> ExtClients
+    ScriptClient --> UnixIn
+    LiveTerminal --> UnixIn
+    ExtClients --> UnixIn
 ```
 
 The parent MCP server uses `IO::Select` to multiplex:
 1. `STDIN`: JSON-RPC commands from the LLM or Opencode.
 2. `PTY Master`: Real-time data from/to the VM via the child bridge.
-3. `Unix Socket`: Listener for external terminal connections.
-4. `Unix Clients`: Active terminal sessions connected to the Unix socket.
+3. `Unix Input/Output Sockets`: Listeners for external terminal connections.
+4. `Unix Clients`: Active terminal sessions connected to the Unix sockets.
 
 When the VM disconnects, the parent detects the PTY closure and automatically restarts the bridge child to maintain persistence.
 
@@ -270,7 +279,8 @@ participant TCP as IO::Socket::INET (TCP 127.0.0.1:port)
 participant Bridge as Bridge process (child)
 participant PTY as IO::Pty (master/slave)
 participant MCP as MCP server (parent)
-participant USock as IO::Socket::UNIX (/tmp/serial_<vm>)
+participant USockIn as IO::Socket::UNIX (/tmp/serial_<vm>.in)
+participant USockOut as IO::Socket::UNIX (/tmp/serial_<vm>.out)
 participant Term as Terminal client
 
 %% Initial connection
@@ -285,15 +295,17 @@ TCP-->>Bridge: Raw data
 Bridge-->>PTY: Write into PTY slave
 PTY-->>MCP: Data read from PTY master
 MCP->>MCP: Buffer ring + JSON stdout notification
-MCP-->>USock: Make data available to clients
+MCP-->>USockOut: Make data available to output clients
 
-Term-->>USock: Unix socket connection
-USock-->>MCP: New connection accepted()
+Term-->>USockOut: Unix output socket connection (read-only)
+USockOut-->>MCP: New connection accepted()
 MCP-->>Term: History + live stream
 
 %% User -> VM flow
-Term-->>USock: Keyboard input (command)
-USock-->>MCP: Client data
+Term->>USockIn: Unix input socket connection (write-only)
+USockIn-->>MCP: New connection accepted()
+Term->>USockIn: Keyboard input (command)
+USockIn->>MCP: Client data
 MCP-->>PTY: Write into PTY master
 PTY-->>Bridge: Data read from PTY slave
 Bridge-->>TCP: Write to TCP socket
@@ -301,11 +313,11 @@ TCP-->>VM: Command received on the serial console
 ```
 
 ### Terminal Access
-For direct interaction outside of the MCP environment, you can use the script itself as a client:
+For direct interaction outside of the MCP environment, you can use the script itself as a client by specifying the output socket:
 ```bash
-./serencp.pl --socket=/tmp/serial_MYVM
+./serencp.pl --socket=/tmp/serial_${VM_NAME}.out
 ```
-New connections automatically receive the last 60 lines of history. Live output notifications are sent automatically when VM data is received, providing real-time streaming without polling.
+New output connections automatically receive the last 60 lines of history. Live output notifications are sent automatically when VM data is received, providing real-time streaming without polling. To send input, the client automatically opens and writes to the corresponding input socket (`/tmp/serial_${VM_NAME}.in`).
 
 ## Troubleshooting
 - **Failed to get tools**: Ensure the script is run in an environment where standard input/output is captured. Use `tools/list` to verify connectivity.

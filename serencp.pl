@@ -242,9 +242,14 @@ sub start_mcp_server {
 					next;
 				}
 				if ($bytes == 0) {
-					debug("STDIN closed (EOF). Shutting down...");
-					$running = 0;
-					next;
+					if (%bridges) {
+						debug("STDIN closed (EOF) but keeping server alive for active bridges");
+						next;
+					} else {
+						debug("STDIN closed (EOF). No active bridges, shutting down...");
+						$running = 0;
+						next;
+					}
 				}
 				for my $line (split /\n/, $buffer) {
 					next unless $line;
@@ -716,7 +721,8 @@ sub bridge_process_child {
 				} elsif ($bytes == 0) {
 					# EOF - Parent closed connection
 					debug("Bridge child: Input PTY slave closed connection");
-					last;
+					$select->remove($pty_in_slave);
+					next;
 				} elsif ($bytes > 0) {
 					debug("Bridge child: Read $bytes bytes from input PTY, forwarding to VM");
 					syswrite($vm_socket, $buffer);
