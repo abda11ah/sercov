@@ -7,6 +7,7 @@ use JSON::PP qw(decode_json encode_json);
 use IO::Socket::UNIX;
 use IO::Pty;
 use IO::Select;
+use Time::HiRes qw(sleep time);
 use POSIX qw(:termios_h strftime WNOHANG setsid TCSANOW ECHO ECHOK ECHOE ICANON);
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 use IPC::Cmd qw(can_run);
@@ -230,6 +231,13 @@ sub start_mcp_server {
 		};
 	debug("Starting $0 MCP Server...");
 	while ($running) {
+		# Exit if no more work to do (STDIN closed and no active bridges)
+		if ($mcp_select->count == 0 && !%bridges) {
+			debug("No more inputs or active bridges. Shutting down...");
+			$running = 0;
+			last;
+		}
+
 		# Handle MCP requests from STDIN (main select)
 		my @mcp_ready = $mcp_select->can_read(0.01);  # Non-blocking check
 		for my $fh (@mcp_ready) {
@@ -244,11 +252,12 @@ sub start_mcp_server {
 				if ($bytes == 0) {
 					if (%bridges) {
 						debug("STDIN closed (EOF) but keeping server alive for active bridges");
-						next;
+						$mcp_select->remove(\*STDIN);
+						last;
 					} else {
 						debug("STDIN closed (EOF). No active bridges, shutting down...");
 						$running = 0;
-						next;
+						last;
 					}
 				}
 				for my $line (split /\n/, $buffer) {
