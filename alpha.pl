@@ -25,7 +25,7 @@ if ($options{'socket'}) {
 	run_unix_socket_client($socket_path);
 	exit 0;
 }
-our $VERSION               = "2.1.0";
+our $VERSION               = "1.1";
 our $PROTOCOL_VERSION      = "2025-11-25";
 our $DEFAULT_VM_PORT       = 4555;
 our $RING_BUFFER_SIZE      = 1000;
@@ -43,31 +43,19 @@ use constant {
 	MCP_INVALID_PARAMS        => -32602,
 	MCP_INTERNAL_ERROR        => -32603,
 	MCP_SERVER_ERROR          => -32000,
-	MCP_RESOURCE_NOT_FOUND    => -32001,
-	MCP_TOOL_EXECUTION_FAILED => -32002,
-	MCP_PERMISSION_DENIED     => -32003,
-	MCP_RATE_LIMITED          => -32004,
-	MCP_VALIDATION_ERROR      => -32005,
-	MCP_PROMPT_TOO_LARGE      => -32010,
-	MCP_CONTEXT_TOO_LARGE     => -32011,
-	MCP_UNSUPPORTED_FORMAT    => -32012,
-};
+	};
 our %LOG_LEVEL_PRIORITY = (
-	debug     => 0,
-	info      => 1,
-	notice    => 2,
-	warning   => 3,
-	error     => 4,
-	critical  => 5,
-	alert     => 6,
-	emergency => 7,
-);
+	debug => 0,
+	info  => 1,
+	error => 2,
+	);
 our $current_log_level  = 'debug';
 our %bridges;
 our %restart_guard;
 our $running            = 1;
 our $PARENT_PID         = $$;
 our $client_initialized = 0;
+our @created_socket_files = ();
 if ($^O !~ /^(linux|darwin|freebsd|openbsd|netbsd|solaris|aix|cygwin|dragonfly|midnightbsd|gnu|haiku|hpux|irix|minix|qnx|sco|sysv|unix)/i) {
 	print encode_utf8(mcp_error(undef, MCP_SERVER_ERROR, "Unsupported Operating System: $^O. This server only runs on *nix-like systems.")) . "\n";
 	exit 1;
@@ -97,13 +85,13 @@ our $term = sub {
 		[ghostty    => ['ghostty', '-e']],
 		[xterm      => ['xterm', '-e']],
 		[urxvt      => ['urxvt', '-e']],
-	);
+		);
 	for my $terminal (@terminals) {
 		my (undef, $config) = @$terminal;
 		return $config if can_run($config->[0]);
 	}
-	return undef;
-}->();
+	return;
+	}->();
 my %TOOLS = (
 	start => {
 		description => "Start the bridge for VM serial console communication.",
@@ -113,17 +101,17 @@ my %TOOLS = (
 			destructiveHint => JSON::PP::false,
 			idempotentHint  => JSON::PP::true,
 			openWorldHint   => JSON::PP::true,
-		},
+			},
 		inputSchema => {
 			type       => "object",
 			properties => {
 				vm_name => { type => "string", description => "Name of the VM" },
 				port    => { type => "string", description => "Port number for VM serial console (default: 4555)" },
-			},
+				},
 			required => ["vm_name"],
-		},
+			},
 		handler => \&tool_start,
-	},
+		},
 	stop => {
 		description => "Stop the bridge.",
 		annotations => {
@@ -132,42 +120,42 @@ my %TOOLS = (
 			destructiveHint => JSON::PP::true,
 			idempotentHint  => JSON::PP::true,
 			openWorldHint   => JSON::PP::false,
-		},
+			},
 		inputSchema => {
 			type       => "object",
 			properties => { vm_name => { type => "string", description => "Name of the VM" } },
 			required   => ["vm_name"],
-		},
+			},
 		handler => \&tool_stop,
-	},
+		},
 	status => {
 		description => "Check the status of the bridge.",
 		annotations => {
 			title         => "Bridge Status",
 			readOnlyHint  => JSON::PP::true,
 			openWorldHint => JSON::PP::false,
-		},
+			},
 		inputSchema => {
 			type       => "object",
 			properties => { vm_name => { type => "string", description => "Name of the VM" } },
 			required   => ["vm_name"],
-		},
+			},
 		handler => \&tool_status,
-	},
+		},
 	read => {
 		description => "Read output from VM serial console (2s timeout). Live output is also streamed via notifications/message.",
 		annotations => {
 			title         => "Read VM Output",
 			readOnlyHint  => JSON::PP::true,
 			openWorldHint => JSON::PP::true,
-		},
+			},
 		inputSchema => {
 			type       => "object",
 			properties => { vm_name => { type => "string", description => "Name of the VM" } },
 			required   => ["vm_name"],
-		},
+			},
 		handler => \&tool_read,
-	},
+		},
 	write => {
 		description => "Send a command to the VM serial console.",
 		annotations => {
@@ -176,21 +164,25 @@ my %TOOLS = (
 			destructiveHint => JSON::PP::false,
 			idempotentHint  => JSON::PP::false,
 			openWorldHint   => JSON::PP::true,
-		},
+			},
 		inputSchema => {
 			type       => "object",
 			properties => {
 				vm_name => { type => "string", description => "Name of the VM" },
 				text    => { type => "string", description => "Command to send to the VM" },
-			},
+				},
 			required => ["vm_name", "text"],
-		},
+			},
 		handler => \&tool_write,
-	},
-);
+		},
+	);
 start_mcp_server() unless caller;
-sub iso8601 {
-	return strftime("%Y-%m-%dT%H:%M:%SZ", gmtime);
+# END block for robust cleanup on abnormal exit (crash, _exit, die, etc.)
+END {
+	# Only run cleanup if we're in the parent process
+	return unless $ == $PARENT_PID;
+	# Call the main cleanup function which handles all socket cleanup
+	cleanup();
 }
 sub should_log {
 	my ($level) = @_;
@@ -229,8 +221,8 @@ sub send_log_notification {
 			level  => $level,
 			logger => $logger || "serencp",
 			data   => $data,
-		},
-	};
+			},
+		};
 	emit_json_line($notification);
 }
 sub send_progress_notification {
@@ -239,15 +231,15 @@ sub send_progress_notification {
 	return unless $$ == $PARENT_PID;
 	return unless $client_initialized;
 	emit_json_line({
-		jsonrpc => "2.0",
-		method  => "notifications/progress",
-		params  => {
-			progressToken => $progressToken,
-			progress      => $progress,
-			total         => $total,
-			message       => $message,
-		},
-	});
+			jsonrpc => "2.0",
+			method  => "notifications/progress",
+			params  => {
+				progressToken => $progressToken,
+				progress      => $progress,
+				total         => $total,
+				message       => $message,
+				},
+		});
 }
 sub send_vm_output_notification {
 	my ($vm_name, $stream, $chunk) = @_;
@@ -262,13 +254,13 @@ sub send_vm_output_notification {
 		# preserve data via escaped representation for JSON-safe transport.
 		$safe_text = $chunk;
 		$safe_text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge;
-	};
+		};
 	send_log_notification('info', "serencp.vm.$vm_name", {
-		type    => "vm_output",
-		vm_name => $vm_name,
-		stream  => $stream,
-		content => $safe_text,
-	});
+			type    => "vm_output",
+			vm_name => $vm_name,
+			stream  => $stream,
+			content => $safe_text,
+		});
 	debug("Sent VM output notification for $vm_name ($stream): " . length($chunk) . " bytes");
 }
 sub mcp_error {
@@ -279,8 +271,8 @@ sub mcp_error {
 		error   => {
 			code    => $code,
 			message => $message,
-		},
-	};
+			},
+		};
 	$error_response->{error}{data} = $data if defined $data;
 	return encode_json($error_response);
 }
@@ -289,7 +281,7 @@ sub tool_exec_error {
 	return {
 		content => [{ type => "text", text => $message }],
 		isError => JSON::PP::true,
-	};
+		};
 }
 sub write_all_nonblocking {
 	my ($fh, $data, $timeout) = @_;
@@ -332,9 +324,12 @@ sub set_nonblocking {
 sub start_mcp_server {
 	local $SIG{INT}  = \&cleanup;
 	local $SIG{TERM} = \&cleanup;
+	local $SIG{HUP}  = \&cleanup;    # Hangup - terminal closed
+	local $SIG{QUIT} = \&cleanup;    # Quit signal
+	local $SIG{PIPE} = 'IGNORE';      # Broken pipe - ignore, let normal handling occur
 	local $SIG{CHLD} = sub {
 		while (waitpid(-1, WNOHANG) > 0) { }
-	};
+		};
 	binmode(STDIN,  ':raw');
 	binmode(STDOUT, ':raw');
 	local $| = 1;
@@ -392,33 +387,33 @@ sub start_mcp_server {
 					my $decoded = decode_utf8($raw_line, FB_CROAK);
 					$request = decode_json($decoded);
 					1;
-				} or do {
+					} or do {
 					my $err = $@ || "unknown parse error";
 					debug("Parse error: $err");
 					emit_json_line({
-						jsonrpc => "2.0",
-						id      => undef,
-						error   => {
-							code    => MCP_PARSE_ERROR,
-							message => "Parse error",
-							data    => "$err",
-						},
-					});
+							jsonrpc => "2.0",
+							id      => undef,
+							error   => {
+								code    => MCP_PARSE_ERROR,
+								message => "Parse error",
+								data    => "$err",
+								},
+						});
 					next;
-				};
+					};
 				my $response = eval { handle_request($request) };
 				if (my $err = $@) {
 					debug("Request handler error: $err");
 					if (ref($request) eq 'HASH' && exists $request->{id}) {
 						emit_json_line({
-							jsonrpc => "2.0",
-							id      => $request->{id},
-							error   => {
-								code    => MCP_INTERNAL_ERROR,
-								message => "Internal error",
-								data    => "$err",
-							},
-						});
+								jsonrpc => "2.0",
+								id      => $request->{id},
+								error   => {
+									code    => MCP_INTERNAL_ERROR,
+									message => "Internal error",
+									data    => "$err",
+									},
+							});
 					}
 					next;
 				}
@@ -451,8 +446,8 @@ sub handle_request {
 				code    => MCP_INVALID_REQUEST,
 				message => "Invalid Request",
 				data    => "Request must be a JSON object",
-			},
-		};
+				},
+			};
 	}
 	my $jsonrpc = $request->{jsonrpc};
 	my $method  = $request->{method};
@@ -460,7 +455,7 @@ sub handle_request {
 	my $id      = $request->{id};
 	my $is_notification = !exists $request->{id};
 	if (defined $jsonrpc && $jsonrpc ne '2.0') {
-		return undef if $is_notification;
+		return if $is_notification;
 		return {
 			jsonrpc => "2.0",
 			id      => is_valid_jsonrpc_id($id) ? $id : undef,
@@ -468,11 +463,11 @@ sub handle_request {
 				code    => MCP_INVALID_REQUEST,
 				message => "Invalid Request",
 				data    => "jsonrpc must be '2.0'",
-			},
-		};
+				},
+			};
 	}
 	if (!defined $method || ref($method) || $method eq '') {
-		return undef if $is_notification;
+		return if $is_notification;
 		return {
 			jsonrpc => "2.0",
 			id      => is_valid_jsonrpc_id($id) ? $id : undef,
@@ -480,22 +475,22 @@ sub handle_request {
 				code    => MCP_INVALID_REQUEST,
 				message => "Invalid Request",
 				data    => "method must be a non-empty string",
-			},
-		};
+				},
+			};
 	}
 	if (ref($params) && ref($params) ne 'HASH' && ref($params) ne 'ARRAY') {
-		return undef if $is_notification;
+		return if $is_notification;
 		return {
 			jsonrpc => "2.0",
 			id      => is_valid_jsonrpc_id($id) ? $id : undef,
 			error   => {
 				code    => MCP_INVALID_PARAMS,
 				message => "Invalid params",
-			},
-		};
+				},
+			};
 	}
 	if ($method eq 'initialize') {
-		return undef if $is_notification;
+		return if $is_notification;
 		return {
 			jsonrpc => "2.0",
 			id      => is_valid_jsonrpc_id($id) ? $id : undef,
@@ -504,7 +499,7 @@ sub handle_request {
 				capabilities    => {
 					logging => {},
 					tools   => { listChanged => JSON::PP::true },
-				},
+					},
 				serverInfo => {
 					name        => "serencp",
 					version     => $VERSION,
@@ -516,11 +511,11 @@ sub handle_request {
 							src      => "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect fill='%23333' width='100' height='100' rx='10'/%3E%3Ctext x='50' y='65' font-size='50' text-anchor='middle' fill='white'%3ES%3C/text%3E%3C/svg%3E",
 							mimeType => "image/svg+xml",
 						}
-					],
-				},
+						],
+					},
 				instructions => "VM output is automatically streamed as real-time notifications/message (level=info, logger=serencp.vm.<name>) when a bridge is active. The 'read' tool is available for explicit polling. Use logging/setLevel to control verbosity.",
-			},
-		};
+				},
+			};
 	}
 	if ($method eq 'notifications/initialized') {
 		$client_initialized = 1;
@@ -528,27 +523,27 @@ sub handle_request {
 		return;
 	}
 	if ($method eq 'ping') {
-		return undef if $is_notification;
+		return if $is_notification;
 		return { jsonrpc => "2.0", id => $id, result => {} };
 	}
 	if ($method eq 'logging/setLevel') {
-		return undef if $is_notification && ref($params) ne 'HASH';
+		return if $is_notification && ref($params) ne 'HASH';
 		my $level = ref($params) eq 'HASH' ? $params->{level} : undef;
 		if ($level && exists $LOG_LEVEL_PRIORITY{$level}) {
 			$current_log_level = $level;
 			debug("Log level set to: $level");
-			return undef if $is_notification;
+			return if $is_notification;
 			return { jsonrpc => "2.0", id => $id, result => {} };
 		}
-		return undef if $is_notification;
+		return if $is_notification;
 		return {
 			jsonrpc => "2.0",
 			id      => $id,
 			error   => {
 				code    => MCP_INVALID_PARAMS,
 				message => "Invalid log level: " . ($level // 'undef') . ". Valid: " . join(', ', sort keys %LOG_LEVEL_PRIORITY),
-			},
-		};
+				},
+			};
 	}
 	if ($method eq 'notifications/cancelled') {
 		my $req_id = ref($params) eq 'HASH' ? $params->{requestId} : undef;
@@ -557,21 +552,21 @@ sub handle_request {
 		return;
 	}
 	if ($method eq 'tools/list') {
-		return undef if $is_notification;
+		return if $is_notification;
 		my @list;
 		for my $name (sort keys %TOOLS) {
 			my %tool_def = (
 				name        => $name,
 				description => $TOOLS{$name}{description},
 				inputSchema => $TOOLS{$name}{inputSchema},
-			);
+				);
 			$tool_def{annotations} = $TOOLS{$name}{annotations} if $TOOLS{$name}{annotations};
 			push @list, \%tool_def;
 		}
 		return { jsonrpc => "2.0", id => $id, result => { tools => \@list } };
 	}
 	if ($method eq 'tools/call') {
-		return undef if $is_notification;
+		return if $is_notification;
 		if (ref($params) ne 'HASH') {
 			return {
 				jsonrpc => "2.0",
@@ -580,8 +575,8 @@ sub handle_request {
 					code    => MCP_INVALID_PARAMS,
 					message => "Invalid params",
 					data    => "tools/call params must be an object",
-				},
-			};
+					},
+				};
 		}
 		my $name = $params->{name};
 		my $args = $params->{arguments} || {};
@@ -593,8 +588,8 @@ sub handle_request {
 					code    => MCP_INVALID_PARAMS,
 					message => "Invalid params",
 					data    => "Tool name must be a non-empty string",
-				},
-			};
+					},
+				};
 		}
 		if (my $tool = $TOOLS{$name}) {
 			my $res = $tool->{handler}->($args);
@@ -609,21 +604,21 @@ sub handle_request {
 					content           => [{ type => "text", text => $json_text }],
 					structuredContent => $res,
 					isError           => JSON::PP::false,
-				},
-			};
+					},
+				};
 		}
 		return {
 			jsonrpc => "2.0",
 			id      => $id,
 			error   => { code => MCP_METHOD_NOT_FOUND, message => "Tool not found: $name" },
-		};
+			};
 	}
-	return undef if $is_notification;
+	return if $is_notification;
 	return {
 		jsonrpc => "2.0",
 		id      => $id,
 		error   => { code => MCP_METHOD_NOT_FOUND, message => "Method not found: $method" },
-	};
+		};
 }
 sub tool_start {
 	my ($params) = @_;
@@ -669,7 +664,7 @@ sub tool_status {
 			port         => $bridge->{port},
 			buffer_size  => scalar(@{ $bridge->{buffer} }),
 			buffer_bytes => $bridge->{buffer_bytes} || 0,
-		};
+			};
 	}
 	return {
 		running      => JSON::PP::false,
@@ -677,7 +672,7 @@ sub tool_status {
 		port         => undef,
 		buffer_size  => 0,
 		buffer_bytes => 0,
-	};
+		};
 }
 sub tool_read {
 	my ($params) = @_;
@@ -688,42 +683,59 @@ sub tool_read {
 	return tool_exec_error("Bridge not running for VM: $vm_name. Use start to start it.")
 		unless bridge_exists($vm_name);
 	debug("Read request for VM: $vm_name");
-	my $socket_path = "/tmp/serial_${vm_name}.out";
-	my $socket = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $socket_path);
-	unless ($socket) {
-		debug("Failed to connect to output socket $socket_path: $!");
-		return { success => JSON::PP::false, output => "" };
-	}
-	set_nonblocking($socket);
-	my $buffer      = "";
+	my $bridge = $bridges{$vm_name};
+	my $text   = "";
 	my $total_bytes = 0;
-	my $start_time  = time();
-	while (time() - $start_time < 2) {
-		my $data;
-		my $bytes = sysread($socket, $data, 4096);
-		if (!defined $bytes) {
-			if ($!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK}) {
+	# First read: open UNIX socket to establish connection
+	# Subsequent reads: read directly from bridge buffer (no socket overhead)
+	my $is_first_read = !exists $bridge->{first_read_done};
+	if ($is_first_read) {
+		my $socket_path = "/tmp/serial_${vm_name}.out";
+		my $socket = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $socket_path);
+		if ($socket) {
+			set_nonblocking($socket);
+			my $buffer      = "";
+			my $start_time  = time();
+			while (time() - $start_time < 2) {
+				my $data;
+				my $bytes = sysread($socket, $data, 4096);
+				if (!defined $bytes) {
+					if ($!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK}) {
+						sleep(0.01);
+						next;
+					}
+					debug("Error reading from output socket: $!");
+					last;
+				}
+				elsif ($bytes == 0) {
+					last;
+				}
+				else {
+					$buffer .= $data;
+					$total_bytes += $bytes;
+				}
 				sleep(0.01);
-				next;
 			}
-			debug("Error reading from output socket: $!");
-			last;
+			$socket->close();
+			eval { $text = decode_utf8($buffer, 1); 1 } or do {
+				$text = $buffer;
+				$text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge;
+				};
 		}
-		elsif ($bytes == 0) {
-			last;
-		}
-		else {
-			$buffer .= $data;
-			$total_bytes += $bytes;
-		}
-		sleep(0.01);
+		$bridge->{first_read_done} = 1;
 	}
-	$socket->close();
-	my $text;
-	eval { $text = decode_utf8($buffer, 1); 1 } or do {
-		$text = $buffer;
-		$text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge;
-	};
+	# Read from bridge buffer - décoder les bytes bruts au moment de l'envoi
+	if ($bridge && $bridge->{buffer} && @{ $bridge->{buffer} }) {
+		# Joindre les bytes bruts sans diviser par \n pour préserver les séquences UTF-8 multi-octets
+		my $raw_bytes = join('', @{ $bridge->{buffer} });
+		$total_bytes = length($raw_bytes);
+		# Décoder les bytes bruts en UTF-8 uniquement au moment de l'envoi
+		eval { $text = decode_utf8($raw_bytes, 1); 1 } or do {
+			# Fallback pour les bytes qui ne sont pas valides UTF-8
+			$text = $raw_bytes;
+			$text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge;
+			};
+	}
 	debug("Read completed: $total_bytes bytes from VM output");
 	return { success => JSON::PP::true, output => $text };
 }
@@ -750,7 +762,7 @@ sub tool_write {
 	return {
 		success => $ok ? JSON::PP::true : JSON::PP::false,
 		message => $ok ? "Command sent successfully" : "Failed to send command",
-	};
+		};
 }
 sub bridge_exists {
 	my ($vm_name) = @_;
@@ -826,6 +838,10 @@ sub start_bridge {
 		remove_socket_file($socket_out_path, "fork failure");
 		return tool_exec_error("Failed to fork bridge process for VM: $vm_name");
 	}
+	if ($pid > 0) {
+		# Parent: put child in its own process group for reliable cleanup
+		setpgrp($pid, $pid);
+	}
 	if ($pid == 0) {
 		close($read_pipe);
 		my $pty_in_slave  = $pty_in->slave();
@@ -852,7 +868,7 @@ sub start_bridge {
 				PeerPort => $port,
 				Proto    => 'tcp',
 				Timeout  => 2,
-			);
+				);
 			unless ($vm_socket) {
 				$retry_count++;
 				debug("Child: Connection attempt $retry_count failed, retrying...");
@@ -904,6 +920,8 @@ sub start_bridge {
 	close($read_pipe);
 	if ($ready) {
 		my $session_id = sprintf("session_%s_%d", $vm_name, time());
+		# Track socket files for cleanup on crash
+		push @created_socket_files, ($socket_in_path, $socket_out_path);
 		$bridges{$vm_name} = {
 			pty_in           => $pty_in,
 			pty_out          => $pty_out,
@@ -918,7 +936,7 @@ sub start_bridge {
 			restarting       => 0,
 			session          => { id => $session_id, clients => {}, input_clients => {} },
 			select           => IO::Select->new($pty_out, $socket_in, $socket_out),
-		};
+			};
 		set_nonblocking($pty_in);
 		set_nonblocking($pty_out);
 		my $term_pid = $old_term_pid;
@@ -936,7 +954,7 @@ sub start_bridge {
 			socket_out   => $socket_out_path,
 			session_id   => $session_id,
 			terminal_pid => $term_pid,
-		};
+			};
 	}
 	debug("Bridge setup failed — cleaning up");
 	terminate_process($pid, "bridge child for VM $vm_name") if $pid;
@@ -999,7 +1017,7 @@ sub bridge_process_child {
 		}
 		last unless $vm_socket->connected();
 	}
-CHILD_EXIT:
+	CHILD_EXIT:
 	debug("Bridge child: Closing connections");
 	close $vm_socket;
 	close $pty_in_slave;
@@ -1009,22 +1027,21 @@ sub terminate_process {
 	my ($pid, $process_desc) = @_;
 	$process_desc ||= "process";
 	return unless $pid && kill(0, $pid);
-	debug("Sending SIGTERM to $process_desc (PID: $pid)");
-	kill('TERM', $pid);
+	# Use process group kill to kill child and any forked descendants
+	debug("Sending SIGTERM to $process_desc (PID: $pid, group)");
+	kill('TERM', -$pid);  # negative = whole process group
 	my $start_time = time();
 	while (time() - $start_time < $SIGTERM_TIMEOUT) {
 		my $wait_result = waitpid($pid, WNOHANG);
-		if ($wait_result == $pid) {
+		if ($wait_result == $pid || $wait_result == -1) {
 			debug("$process_desc (PID: $pid) terminated gracefully");
 			return 1;
-		} elsif ($wait_result == -1) {
-			last;
 		}
 		sleep(0.1);
 	}
 	if (kill(0, $pid)) {
 		debug("$process_desc (PID: $pid) still alive, sending SIGKILL");
-		kill('KILL', $pid);
+		kill('KILL', -$pid);  # kill entire process group
 		sleep($SIGKILL_WAIT);
 		if (kill(0, $pid)) {
 			debug("Warning: $process_desc (PID: $pid) still alive after SIGKILL");
@@ -1094,23 +1111,14 @@ sub monitor_bridge {
 		if (defined $bytes && $bytes > 0) {
 			debug("Monitor: Read $bytes bytes from VM via output PTY");
 			send_vm_output_notification($vm_name, "stdout", $buffer);
-			my $text;
-			eval { $text = decode_utf8($buffer, 1); 1 } or do {
-				$text = $buffer;
-				$text =~ s/\r/\n/g;
-				$text =~ s/([^\x20-\x7E\r\n\t])/ /g;
-			};
-			$text =~ s/\r/\n/g;
-			my @new_lines = grep { defined $_ && length($_) > 0 } split /\n/, $text;
-			if (@new_lines) {
-				my $total_length = 0;
-				$total_length += length($_) for @new_lines;
-				push @{ $bridge->{buffer} }, @new_lines;
-				$bridge->{buffer_bytes} += $total_length;
-				while (@{ $bridge->{buffer} } > $RING_BUFFER_SIZE || $bridge->{buffer_bytes} > $MAX_BUFFER_BYTES) {
-					my $removed = shift @{ $bridge->{buffer} };
-					$bridge->{buffer_bytes} -= length($removed) if defined $removed;
-				}
+			# Stocker uniquement les bytes bruts dans le buffer pour préserver les séquences UTF-8 multi-octets
+			# Ne pas diviser par \n pour éviter de casser les séquences multi-octets
+			push @{ $bridge->{buffer} }, $buffer;
+			$bridge->{buffer_bytes} += $bytes;
+			# Gérer la taille du buffer en supprimant les éléments les plus anciens si nécessaire
+			while (@{ $bridge->{buffer} } > $RING_BUFFER_SIZE || $bridge->{buffer_bytes} > $MAX_BUFFER_BYTES) {
+				my $removed = shift @{ $bridge->{buffer} };
+				$bridge->{buffer_bytes} -= length($removed) if defined $removed;
 			}
 			for my $cid (keys %{ $bridge->{session}{clients} }) {
 				my $client = $bridge->{session}{clients}{$cid};
@@ -1147,9 +1155,10 @@ sub monitor_bridge {
 				my $start = @{ $bridge->{buffer} } > $CONSOLE_HISTORY_LINES
 					? @{ $bridge->{buffer} } - $CONSOLE_HISTORY_LINES
 					: 0;
-				my $history = join("\n", @{ $bridge->{buffer} }[$start .. $#{ $bridge->{buffer} }]) . "\n";
-				my $bytes = encode_utf8($history);
-				unless (write_all_nonblocking($client, $bytes, 1.0)) {
+				# Joindre les bytes bruts sans diviser par \n pour préserver les séquences UTF-8 multi-octets
+				my $raw_bytes = join('', @{ $bridge->{buffer} }[$start .. $#{ $bridge->{buffer} }]);
+				# Encoder directement les bytes bruts sans décodage UTF-8 intermédiaire
+				unless (write_all_nonblocking($client, $raw_bytes, 1.0)) {
 					$bridge->{select}->remove($client);
 					delete $bridge->{session}{clients}{$client_id};
 					close $client;
@@ -1207,11 +1216,66 @@ sub monitor_bridge {
 }
 sub cleanup {
 	$running = 0;
-	for my $vm_name (keys %bridges) {
-		stop_bridge($vm_name, 1);
+	# Phase 1: ask nicely
+	for my $vm (keys %bridges) {
+		stop_bridge($vm, 1);
 	}
-	debug("$0 MCP Server stopped");
-	exit(0);
+	# Phase 2: double-check & force cleanup of any remaining processes
+	sleep(1.0);
+	for my $vm (keys %bridges) {
+		my $b = $bridges{$vm};
+		terminate_process($b->{pid}, "bridge $vm (force phase)") if $b && $b->{pid};
+		terminate_process($b->{terminal_pid}, "terminal $vm (force)") if $b && $b->{terminal_pid};
+	}
+	cleanup_all_socket_files();
+	# Remove END protection so we don't recurse if END calls us again
+	undef $PARENT_PID if defined $PARENT_PID;
+	debug("Cleanup completed");
+	# Let normal exit happen - do NOT call exit() here
+}
+sub cleanup_all_socket_files {
+	my $remove_with_retry = sub {
+		my ($path) = @_;
+		return unless defined $path && length $path;
+		return unless -e $path || -S $path;
+		my $retry_count = 0;
+		while ($retry_count < 5) {
+			last if unlink($path);
+			$retry_count++;
+			last unless -e $path || -S $path;
+			sleep(0.1);
+		}
+		};
+	# 1. Clean up all tracked socket files
+	for my $socket_path (@created_socket_files) {
+		next unless defined $socket_path && length $socket_path;
+		debug("Cleaning up tracked socket file: $socket_path");
+		$remove_with_retry->($socket_path);
+	}
+	@created_socket_files = ();
+	# 2. Clean up probable orphaned socket files
+	my @potential_orphans = glob("/tmp/serial_*.in /tmp/serial_*.out");
+	for my $path (@potential_orphans) {
+		next unless defined $path && length $path;
+		next unless -S $path;           # only actual sockets
+		# Test whether the socket appears to be in use
+		my $is_alive = 0;
+		eval {
+			my $test_sock = IO::Socket::UNIX->new(
+				Type    => SOCK_STREAM,
+				Peer    => $path,
+				Timeout => 0.1,
+				);
+			if ($test_sock) {
+				$test_sock->close();
+				$is_alive = 1;
+			}
+			1;
+			};
+		next if $is_alive;
+		debug("Removing probable orphaned socket file: $path");
+		$remove_with_retry->($path);
+	}
 }
 sub spawn_terminal_client {
 	my ($vm_name, $socket_in_path, $socket_out_path) = @_;
@@ -1222,7 +1286,7 @@ sub spawn_terminal_client {
 		my @fallbacks = (
 			['xterm', '-e'],
 			['sh', '-c'],
-		);
+			);
 		for my $cfg (@fallbacks) {
 			if (can_run($cfg->[0])) {
 				$terminal_config = $cfg;
@@ -1233,10 +1297,10 @@ sub spawn_terminal_client {
 	unless ($terminal_config) {
 		debug("No compatible terminal emulator found");
 		send_log_notification('error', 'serencp', {
-			message    => "No compatible terminal emulator found",
-			vm_name    => $vm_name,
-			suggestion => "Connect manually to /tmp/serial_${vm_name}.in and .out",
-		});
+				message    => "No compatible terminal emulator found",
+				vm_name    => $vm_name,
+				suggestion => "Connect manually to /tmp/serial_${vm_name}.in and .out",
+			});
 		return;
 	}
 	my @client_cmd = ($^X, $0, "--socket=$socket_out_path");
@@ -1244,10 +1308,14 @@ sub spawn_terminal_client {
 	if (!defined $pid) {
 		debug("Failed to fork for terminal: $!");
 		send_log_notification('error', 'serencp', {
-			message => "Failed to fork terminal process: $!",
-			vm_name => $vm_name,
-		});
+				message => "Failed to fork terminal process: $!",
+				vm_name => $vm_name,
+			});
 		return;
+	}
+	if ($pid > 0) {
+		# Parent: put child in its own process group for reliable cleanup
+		setpgrp($pid, $pid);
 	}
 	if ($pid == 0) {
 		setsid();
@@ -1276,9 +1344,9 @@ sub spawn_terminal_client {
 	}
 	debug("Terminal spawned with PID: $pid");
 	send_log_notification('info', 'serencp', {
-		message => "Terminal spawned for VM: $vm_name (PID: $pid)",
-		vm_name => $vm_name,
-	});
+			message => "Terminal spawned for VM: $vm_name (PID: $pid)",
+			vm_name => $vm_name,
+		});
 	return $pid;
 }
 sub run_unix_socket_client {
