@@ -14,7 +14,6 @@ use IPC::Cmd qw(can_run);
 use Errno qw(EAGAIN EWOULDBLOCK EINTR EPIPE);
 use Getopt::Long;
 use Time::HiRes qw(sleep time);
-use bytes;
 our %options;
 GetOptions(\%options, 'socket=s') or exit 1;
 if ($options{'socket'}) {
@@ -352,10 +351,8 @@ start_mcp_server() unless caller;
 # END block for robust cleanup on abnormal exit (crash, _exit, die, etc.)
 END {
 	# Only run cleanup if we're in the parent process
-	printf STDERR "[END $] END block entered (PARENT_PID=" . ($PARENT_PID // 'undef') . ")\n" if should_log('debug');
+	return unless $IS_PARENT;
 	return unless $$ == $PARENT_PID;
-	printf STDERR "[END $] Running cleanup as parent\n" if should_log('debug');
-	# Call the main cleanup function which handles all socket cleanup
 	cleanup();
 }
 sub should_log {
@@ -368,7 +365,7 @@ sub debug {
 	my ($message) = @_;
 	return unless should_log('debug');
 	printf STDERR "[DEBUG %d] %s\n", $$, $message;
-	send_log_notification('debug', 'serencp', $message);
+	# Notification disabled to prevent response delays - use logging/setLevel instead
 }
 sub shell_quote {
 	my ($s) = @_;
@@ -634,17 +631,12 @@ sub start_mcp_server {
 	binmode(STDIN,  ':raw');
 	binmode(STDOUT, ':raw');
 	local $| = 1;
-	my $flags = fcntl(STDIN, F_GETFL, 0);
-	if (!defined $flags) {
-		print STDERR "Can't get flags for STDIN: $!\n";
-		print encode_utf8(mcp_error(undef, MCP_INTERNAL_ERROR, "Can't get flags for STDIN: $!")) . "\n";
-		exit 1;
-	}
-	if (!defined fcntl(STDIN, F_SETFL, $flags | O_NONBLOCK)) {
+	unless (set_nonblocking(\*STDIN)) {
 		print STDERR "Can't set STDIN nonblocking: $!\n";
 		print encode_utf8(mcp_error(undef, MCP_INTERNAL_ERROR, "Can't set STDIN nonblocking: $!")) . "\n";
 		exit 1;
 	}
+	set_nonblocking(\*STDOUT);
 	printf STDERR "[DEBUG $] Starting $0 MCP Server (protocol $PROTOCOL_VERSION)...\n" if should_log('debug');
 	my $stdin_buffer = '';
 	while ($running) {
@@ -1402,7 +1394,7 @@ sub monitor_bridge {
 			# Gérer la taille du buffer en supprimant les éléments les plus anciens si nécessaire
 			while (@{ $bridge->{buffer} } > $RING_BUFFER_SIZE || $bridge->{buffer_bytes} > $MAX_BUFFER_BYTES) {
 				my $removed_ref = shift @{ $bridge->{buffer} };
-				$bridge->{buffer_bytes} -= bytes::length(${ $removed_ref }) if defined $removed_ref;
+				$bridge->{buffer_bytes} -= length(${ $removed_ref }) if defined $removed_ref;
 			}
 			for my $cid (keys %{ $bridge->{session}{clients} }) {
 				my $client = $bridge->{session}{clients}{$cid};
@@ -1512,11 +1504,6 @@ sub cleanup {
 		terminate_process($b->{pid}, "bridge $vm (force phase)") if $b && $b->{pid};
 		terminate_process($b->{terminal_pid}, "terminal $vm (force)") if $b && $b->{terminal_pid};
 	}
-	cleanup_all_socket_files();
-	debug("Cleanup completed");
-	# Let normal exit happen - do NOT call exit() here
-}
-sub cleanup_all_socket_files {
 	my $remove_with_retry = sub {
 		my ($path) = @_;
 		return unless defined $path && length $path;
@@ -1528,7 +1515,7 @@ sub cleanup_all_socket_files {
 			last unless -e $path || -S $path;
 			sleep(0.1);
 		}
-		};
+	};
 	# 1. Clean up all tracked socket files
 	for my $socket_path (@created_socket_files) {
 		next unless defined $socket_path && length $socket_path;
@@ -1559,6 +1546,8 @@ sub cleanup_all_socket_files {
 		debug("Removing probable orphaned socket file: $path");
 		$remove_with_retry->($path);
 	}
+	debug("Cleanup completed");
+	# Let normal exit happen - do NOT call exit() here
 }
 sub spawn_terminal_client {
 	my ($vm_name, $socket_in_path, $socket_out_path) = @_;
