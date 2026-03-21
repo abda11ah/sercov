@@ -73,42 +73,203 @@ our $running = 1;
 our $PARENT_PID = $$;
 # Main MCP select - handles only STDIN for JSON-RPC requests
 my $mcp_select = IO::Select->new(\*STDIN);
-# Terminal detection and spawning helpers
-our $term = sub {
-	# macOS Terminal.app detection - early return for efficiency
-	if ($^O eq 'darwin') {
-		return ['terminal-macos', sub { "open -a Terminal \"$_[0]\"" }]
-			if -d "/Applications/Terminal.app";
-		return ['iterm-macos', sub { "open -a iTerm \"$_[0]\"" }]
-			if -d "/Applications/iTerm.app";
+# Enhanced terminal detection with environment variables and XDG support
+sub detect_terminal {
+	# Priority 1: Check environment variables first (user's preferred terminal)
+	# TERM_PROGRAM is set by many terminals on macOS and some Linux environments
+	if ($ENV{TERM_PROGRAM}) {
+		debug("TERM_PROGRAM detected: $ENV{TERM_PROGRAM}");
+		my %term_program_map = (
+			'Apple_Terminal'          => ['terminal-macos', sub { "open -a Terminal \"$_[0]\"" }],
+			'Apple_Terminal_Default' => ['terminal-macos', sub { "open -a Terminal \"$_[0]\"" }],
+			'iTerm.app'              => ['iterm-macos', sub { "open -a iTerm \"$_[0]\"" }],
+			'iTerm2'                 => ['iterm-macos', sub { "open -a iTerm \"$_[0]\"" }],
+			'vscode'                 => ['code', '--wait'],
+			'vscode-insiders'        => ['code-insiders', '--wait'],
+			'Hyper'                  => ['hyper', '-e'],
+		);
+		if (my $config = $term_program_map{$ENV{TERM_PROGRAM}}) {
+			my $bin = $config->[0];
+			if (can_run($bin) || ($bin eq 'open' && $^O eq 'darwin')) {
+				debug("Using TERM_PROGRAM terminal: $ENV{TERM_PROGRAM}");
+				return $config;
+			}
+		}
 	}
-	# Define terminals in order of preference for better selection
+	
+	# Priority 2: Check TERMINAL environment variable (common on Linux)
+	if ($ENV{TERMINAL} && can_run($ENV{TERMINAL})) {
+		debug("TERMINAL env detected: $ENV{TERMINAL}");
+		my %terminal_args = (
+			'gnome-terminal'      => ['gnome-terminal', '-- sh -c'],
+			'konsole'             => ['konsole', '-e'],
+			'terminator'          => ['terminator', '-e'],
+			'alacritty'           => ['alacritty', '-e'],
+			'kitty'               => ['kitty', sub { "kitty $_[0]" }],
+			'wezterm'             => ['wezterm', sub { "wezterm start -- $_[0]" }],
+			'ghostty'             => ['ghostty', '-e'],
+			'tilix'               => ['tilix', '-e'],
+			'xfce4-terminal'     => ['xfce4-terminal', '--command'],
+			'mate-terminal'       => ['mate-terminal', '--command'],
+			'qterminal'           => ['qterminal', '-e'],
+			'lxterminal'          => ['lxterminal', '--command'],
+			'urxvt'               => ['urxvt', '-e'],
+			'xterm'               => ['xterm', '-e'],
+			'rxvt'                => ['rxvt', '-e'],
+			'eterm-color'        => ['eterm-color', '-e'],
+		);
+		if (my $args = $terminal_args{$ENV{TERMINAL}}) {
+			return $args;
+		}
+		# Generic fallback for unknown terminal
+		return [$ENV{TERMINAL}, '-e'];
+	}
+	
+	# Priority 3: Check XDG .desktop files for installed terminals
+	my @xdg_dirs = (
+		$ENV{XDG_DATA_HOME} ? "$ENV{XDG_DATA_HOME}/applications" : ("$ENV{HOME}/.local/share/applications"),
+		'/usr/share/applications',
+		'/usr/local/share/applications',
+	);
+	push @xdg_dirs, '/etc/xdg/applications' if -d '/etc/xdg/applications';
+	
+	my %desktop_terminals = (
+		'gnome-terminal.desktop'     => ['gnome-terminal', '-- sh -c'],
+		'konsole.desktop'            => ['konsole', '-e'],
+		'org.kde.konsole.desktop'    => ['konsole', '-e'],
+		'terminator.desktop'         => ['terminator', '-e'],
+		'releafs.Terminator.desktop'=> ['terminator', '-e'],
+		'alacritty.desktop'          => ['alacritty', '-e'],
+		'io.alacritty.desktop'       => ['alacritty', '-e'],
+		'kitty.desktop'              => ['kitty', sub { "kitty $_[0]" }],
+		'kitty-term.desktop'         => ['kitty', sub { "kitty $_[0]" }],
+		'wezterm.desktop'            => ['wezterm', sub { "wezterm start -- $_[0]" }],
+		'com.wezterm.desktop'        => ['wezterm', sub { "wezterm start -- $_[0]" }],
+		'ghostty.desktop'            => ['ghostty', '-e'],
+		'com.standardnotes.ghostty.desktop' => ['ghostty', '-e'],
+		'tilix.desktop'              => ['tilix', '-e'],
+		'com.gexperts.Tilix.desktop' => ['tilix', '-e'],
+		'xfce4-terminal.desktop'     => ['xfce4-terminal', '--command'],
+		'mate-terminal.desktop'      => ['mate-terminal', '--command'],
+		'qterminal.desktop'         => ['qterminal', '-e'],
+		'lxterminal.desktop'         => ['lxterminal', '--command'],
+		'deepin-terminal.desktop'    => ['deepin-terminal', '-x'],
+		'guake.desktop'              => ['guake', '-e'],
+		'xterm.desktop'              => ['xterm', '-e'],
+		'urxvt.desktop'              => ['urxvt', '-e'],
+		'rxvt.desktop'               => ['rxvt', '-e'],
+	);
+	
+	for my $dir (@xdg_dirs) {
+		next unless -d $dir;
+		debug("Checking XDG directory: $dir");
+		for my $desktop_file (keys %desktop_terminals) {
+			my $full_path = "$dir/$desktop_file";
+			if (-f $full_path) {
+				my $config = $desktop_terminals{$desktop_file};
+				my $bin = $config->[0];
+				if (can_run($bin)) {
+					debug("Found terminal via XDG: $desktop_file -> $bin");
+					return $config;
+				}
+			}
+		}
+	}
+	
+	# Priority 4: Check common desktop environments and session type
+	if ($ENV{XDG_CURRENT_DESKTOP} || $ENV{XDG_SESSION_DESKTOP}) {
+		my $desktop = $ENV{XDG_CURRENT_DESKTOP} || $ENV{XDG_SESSION_DESKTOP};
+		debug("XDG desktop detected: $desktop");
+		
+		my %de_terminals = (
+			'GNOME'        => ['gnome-terminal', '-- sh -c'],
+			'KDE'          => ['konsole', '-e'],
+			'KDE-Plasma'   => ['konsole', '-e'],
+			'XFCE'         => ['xfce4-terminal', '--command'],
+			'MATE'         => ['mate-terminal', '--command'],
+			'Cinnamon'     => ['gnome-terminal', '-- sh -c'],
+			'Deepin'       => ['deepin-terminal', '-x'],
+			'Unity'        => ['gnome-terminal', '-- sh -c'],
+			'LXDE'         => ['lxterminal', '--command'],
+			'LXQt'         => ['qterminal', '-e'],
+			'Budgie:GNOME' => ['gnome-terminal', '-- sh -c'],
+			'Pantheon'     => ['io.elementary.terminal', '-e'],
+			'Gnome'        => ['gnome-terminal', '-- sh -c'],
+		);
+		
+		if (my $config = $de_terminals{$desktop}) {
+			if (can_run($config->[0])) {
+				debug("Using DE-specific terminal: $desktop -> $config->[0]");
+				return $config;
+			}
+		}
+		for my $de (keys %de_terminals) {
+			if ($desktop =~ /$de/i) {
+				my $config = $de_terminals{$de};
+				if (can_run($config->[0])) {
+					debug("Using DE-specific terminal (partial match): $desktop -> $config->[0]");
+					return $config;
+				}
+			}
+		}
+	}
+	
+	# Priority 5: macOS-specific detection
+	if ($^O eq 'darwin') {
+		return ['terminal-macos', sub { "open -a Terminal \"$_[0]\"" }] if -d "/Applications/Terminal.app";
+		return ['iterm-macos', sub { "open -a iTerm \"$_[0]\"" }] if -d "/Applications/iTerm.app";
+		return ['iterm-macos', sub { "open -a iTerm \"$_[0]\"" }] if -d "/Applications/iTerm2.app";
+		for my $prefix ('/Applications/Homebrew/*Terminal*.app', '/Applications/*.app') {
+			for my $app (glob($prefix)) {
+				if ($app =~ /Terminal\.app$/i) {
+					return ['terminal-macos', sub { "open -a Terminal \"$_[0]\"" }];
+				}
+				elsif ($app =~ /iTerm/i) {
+					return ['iterm-macos', sub { "open -a iTerm \"$_[0]\"" }];
+				}
+			}
+		}
+	}
+	
+	# Priority 6: Comprehensive fallback list
 	my @terminals = (
 		[gnome      => [ 'gnome-terminal', '-- sh -c' ]],
 		[konsole    => [ 'konsole',        '-e' ]],
-		[terminator => [ 'terminator',     '-e' ]],
-		[guake      => [ 'guake',          '-e' ]],
-		[tilix      => [ 'tilix',          '-e' ]],
-		[alacritty  => [ 'alacritty',      '-e' ]],
 		[kitty      => [ 'kitty',          sub { "kitty $_[0]" } ]],
+		[wezterm    => [ 'wezterm',        sub { "wezterm start -- $_[0]" } ]],
+		[alacritty  => [ 'alacritty',      '-e' ]],
+		[ghostty    => [ 'ghostty',        '-e' ]],
+		[terminator => [ 'terminator',     '-e' ]],
+		[tilix      => [ 'tilix',          '-e' ]],
 		[xfce4      => [ 'xfce4-terminal', '--command' ]],
+		[mate       => [ 'mate-terminal',  '--command' ]],
+		[guake      => [ 'guake',          '-e' ]],
+		[qterminal  => [ 'qterminal',      '-e' ]],
 		[lxterminal => [ 'lxterminal',     '--command' ]],
 		[deepin     => [ 'deepin-terminal','-x' ]],
-		[mate       => [ 'mate-terminal',  '--command' ]],
-		[qterminal  => [ 'qterminal',      '-e' ]],
-		[wezterm    => [ 'wezterm',        sub { "wezterm start -- $_[0]" } ]],
-		[ghostty    => [ 'ghostty',        '-e' ]],
 		[xterm      => [ 'xterm',          '-e' ]],
 		[urxvt      => [ 'urxvt',          '-e' ]],
+		[rxvt       => [ 'rxvt',           '-e' ]],
+		[eterm      => [ 'eterm-color',    '-e' ]],
 	);
-	# Return first available terminal - optimized loop
+	
 	for my $terminal (@terminals) {
 		my (undef, $config) = @$terminal;
 		return $config if can_run($config->[0]);
 	}
-	undef; # Explicit undef return for clarity
+	
+	# Ultimate fallback
+	my @fallback_terminals = qw(xterm gnome-terminal konsole kitty wezterm alacritty terminal);
+	for my $bin (@fallback_terminals) {
+		return [$bin, '-e'] if can_run($bin);
 	}
-	->();
+	
+	debug("No terminal emulator detected");
+	return;
+}
+
+# Initialize terminal detection
+our $term = detect_terminal();
 # Tool definitions
 my %TOOLS = (
 	start => {
