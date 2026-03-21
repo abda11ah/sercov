@@ -1,2 +1,3 @@
 mock_vm.pl
 *.json
+*test*

@@ -14,6 +14,7 @@ use IPC::Cmd qw(can_run);
 use Errno qw(EAGAIN EWOULDBLOCK EINTR EPIPE);
 use Getopt::Long;
 use Time::HiRes qw(sleep time);
+use bytes;
 our %options;
 GetOptions(\%options, 'socket=s') or exit 1;
 if ($options{'socket'}) {
@@ -31,11 +32,12 @@ our $DEFAULT_VM_PORT       = 4555;
 our $RING_BUFFER_SIZE      = 1000;
 our $MAX_BUFFER_BYTES      = 10 * 1024 * 1024;
 our $CONSOLE_HISTORY_LINES = 60;
-our $DEBUG                 = 1;
 our $SIGTERM_TIMEOUT = 5;
 our $SIGKILL_WAIT    = 1;
 our $READ_TIMEOUT    = 10;
-our $RESTART_BACKOFF = 1.0;
+our $RESTART_BACKOFF_INITIAL = 1.0;    # Initial backoff in seconds
+our $RESTART_BACKOFF_MAX     = 60;     # Maximum backoff cap in seconds
+our %restart_backoff;  # Per-VM exponential backoff state: { vm_name => current_backoff_seconds }
 use constant {
 	MCP_PARSE_ERROR           => -32700,
 	MCP_INVALID_REQUEST       => -32600,
@@ -54,8 +56,14 @@ our %bridges;
 our %restart_guard;
 our $running            = 1;
 our $PARENT_PID         = $$;
+our $IS_PARENT          = 1;
 our $client_initialized = 0;
 our @created_socket_files = ();
+
+# Write buffer system for truly non-blocking writes
+# Each entry: { buffer => [], buffer_bytes => 0, fileno => int }
+our %write_buffers;
+our $MAX_WRITE_BUFFER_BYTES = 1024 * 1024;  # 1MB max per destination
 if ($^O !~ /^(linux|darwin|freebsd|openbsd|netbsd|solaris|aix|cygwin|dragonfly|midnightbsd|gnu|haiku|hpux|irix|minix|qnx|sco|sysv|unix)/i) {
 	print encode_utf8(mcp_error(undef, MCP_SERVER_ERROR, "Unsupported Operating System: $^O. This server only runs on *nix-like systems.")) . "\n";
 	exit 1;
@@ -106,7 +114,7 @@ my %TOOLS = (
 			type       => "object",
 			properties => {
 				vm_name => { type => "string", description => "Name of the VM" },
-				port    => { type => "string", description => "Port number for VM serial console (default: 4555)" },
+				port    => { type => "integer", description => "Port number for VM serial console (default: 4555)" },
 				},
 			required => ["vm_name"],
 			},
@@ -180,7 +188,9 @@ start_mcp_server() unless caller;
 # END block for robust cleanup on abnormal exit (crash, _exit, die, etc.)
 END {
 	# Only run cleanup if we're in the parent process
-	return unless $ == $PARENT_PID;
+	printf STDERR "[END $] END block entered (PARENT_PID=" . ($PARENT_PID // 'undef') . ")\n" if should_log('debug');
+	return unless $$ == $PARENT_PID;
+	printf STDERR "[END $] Running cleanup as parent\n" if should_log('debug');
 	# Call the main cleanup function which handles all socket cleanup
 	cleanup();
 }
@@ -192,7 +202,7 @@ sub should_log {
 }
 sub debug {
 	my ($message) = @_;
-	return unless $DEBUG;
+	return unless should_log('debug');
 	printf STDERR "[DEBUG %d] %s\n", $$, $message;
 	send_log_notification('debug', 'serencp', $message);
 }
@@ -283,9 +293,61 @@ sub tool_exec_error {
 		isError => JSON::PP::true,
 		};
 }
+# Truly non-blocking write with optional buffer queue
+# Mode 0: Pure non-blocking, return immediately if can't write
+# Mode 1: Buffered mode - queue data if can't write immediately
+# Mode 2: Legacy mode - retry with timeout (original behavior, default for backward compatibility)
 sub write_all_nonblocking {
+	my ($fh, $data, $timeout, $mode) = @_;
+	$timeout = 2.0 unless defined $timeout;  # Default 2s timeout for backward compatibility
+	$mode    = 2 unless defined $mode;        # Default to legacy timeout mode for backward compatibility
+
+	return 1 unless defined $fh;
+	return 1 unless defined $data;
+	return 1 unless length $data;
+
+	my $fd = fileno($fh);
+	return 0 unless defined $fd;
+
+	# Mode 2: Legacy timeout-based retry (original behavior, kept for compatibility)
+	if ($mode == 2) {
+		return _write_all_timeout($fh, $data, $timeout) if $timeout > 0;
+	}
+
+	# Try immediate non-blocking write first
+	my $written = syswrite($fh, $data, length($data));
+
+	if (defined $written) {
+		# All data written
+		return 1 if $written == length($data);
+
+		# Partial write - handle based on mode
+		if ($mode == 0) {
+			# Pure non-blocking: return how many bytes were written
+			return $written;
+		}
+		# Buffered mode: queue remaining
+		my $remaining = substr($data, $written);
+		return _queue_write_buffer($fh, $remaining, $fd);
+	}
+
+	# Write failed
+	if ($!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK}) {
+		if ($mode == 0) {
+			# Pure non-blocking: return 0 to indicate no bytes written (would block)
+			return 0;
+		}
+		# Buffered mode: queue the data
+		return _queue_write_buffer($fh, $data, $fd);
+	}
+
+	# Real error
+	return 0;
+}
+
+# Internal: Legacy timeout-based write (original implementation)
+sub _write_all_timeout {
 	my ($fh, $data, $timeout) = @_;
-	$timeout = 2.0 unless defined $timeout;
 	return 1 unless defined $fh;
 	return 1 unless defined $data;
 	return 1 unless length $data;
@@ -314,6 +376,105 @@ sub write_all_nonblocking {
 		return 0;
 	}
 	return 1;
+}
+
+# Internal: Queue data into write buffer for async processing
+sub _queue_write_buffer {
+	my ($fh, $data, $fd) = @_;
+	return 0 unless defined $data && length $data;
+	$fd = fileno($fh) unless defined $fd;
+	return 0 unless defined $fd;
+
+	# Check buffer limit
+	if ($write_buffers{$fd}{buffer_bytes} && $write_buffers{$fd}{buffer_bytes} >= $MAX_WRITE_BUFFER_BYTES) {
+		warn "Write buffer full for fd $fd, dropping data" if should_log('debug');
+		return 0;
+	}
+
+	# Initialize buffer if needed
+	unless (exists $write_buffers{$fd}) {
+		$write_buffers{$fd} = {
+			fh           => $fh,
+			buffer       => [],
+			buffer_bytes => 0,
+			fileno       => $fd,
+		};
+	}
+
+	# Add to queue
+	push @{ $write_buffers{$fd}{buffer} }, $data;
+	$write_buffers{$fd}{buffer_bytes} += length($data);
+
+	return 1;  # Successfully queued
+}
+
+# Flush pending write buffers for a specific filehandle or all buffers
+# Returns: number of bytes written across all flushes
+sub flush_write_buffers {
+	my ($fd) = @_;
+	my $total_written = 0;
+
+	my @fds_to_process = defined $fd ? ($fd) : keys %write_buffers;
+
+	for my $flush_fd (@fds_to_process) {
+		next unless exists $write_buffers{$flush_fd};
+		next unless @{ $write_buffers{$flush_fd}{buffer} };
+
+		my $buf_ref = $write_buffers{$flush_fd};
+		my $fh = $buf_ref->{fh};
+
+		# Process buffer queue
+		while (@{ $buf_ref->{buffer} }) {
+			my $data = $buf_ref->{buffer}[0];  # Peek at first item
+			my $written = syswrite($fh, $data, length($data));
+
+			if (defined $written) {
+				if ($written == length($data)) {
+					# Fully written - remove from queue
+					shift @{ $buf_ref->{buffer} };
+					$buf_ref->{buffer_bytes} -= $written;
+					$total_written += $written;
+				} else {
+					# Partial write - modify data in place and stop
+					$buf_ref->{buffer}[0] = substr($data, $written);
+					$buf_ref->{buffer_bytes} -= $written;
+					$total_written += $written;
+					last;
+				}
+			} elsif ($!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK}) {
+				# Would block - stop processing this fd
+				last;
+			} else {
+				# Error - remove this buffer entry and continue
+				warn "Write error on fd $flush_fd: $!" if should_log('debug');
+				shift @{ $buf_ref->{buffer} };
+				$buf_ref->{buffer_bytes} -= length($data) if length($data) > 0;
+				last;
+			}
+		}
+
+		# Clean up empty buffers
+		delete $write_buffers{$flush_fd} unless @{ $buf_ref->{buffer} };
+	}
+
+	return $total_written;
+}
+
+# Get write buffer status for diagnostics
+sub get_write_buffer_status {
+	my ($fd) = @_;
+	return unless %write_buffers;
+
+	my @status;
+	for my $buf_fd (keys %write_buffers) {
+		next if defined $fd && $buf_fd != $fd;
+		push @status, {
+			fileno       => $buf_fd,
+			buffer_items => scalar(@{ $write_buffers{$buf_fd}{buffer} }),
+			buffer_bytes => $write_buffers{$buf_fd}{buffer_bytes},
+		};
+	}
+	return @status;
 }
 sub set_nonblocking {
 	my ($fh) = @_;
@@ -344,11 +505,11 @@ sub start_mcp_server {
 		print encode_utf8(mcp_error(undef, MCP_INTERNAL_ERROR, "Can't set STDIN nonblocking: $!")) . "\n";
 		exit 1;
 	}
-	print STDERR "[DEBUG $$] Starting $0 MCP Server (protocol $PROTOCOL_VERSION)...\n" if $DEBUG;
+	printf STDERR "[DEBUG $] Starting $0 MCP Server (protocol $PROTOCOL_VERSION)...\n" if should_log('debug');
 	my $stdin_buffer = '';
 	while ($running) {
 		if ($mcp_select->count == 0 && !%bridges) {
-			print STDERR "[DEBUG $$] No more inputs or active bridges. Shutting down...\n" if $DEBUG;
+			printf STDERR "[DEBUG $] No more inputs or active bridges. Shutting down...\n" if should_log('debug');
 			$running = 0;
 			last;
 		}
@@ -428,6 +589,10 @@ sub start_mcp_server {
 				monitor_bridge($vm_name, $fh);
 			}
 		}
+
+		# Flush pending write buffers (non-blocking, async writes)
+		flush_write_buffers() if %write_buffers;
+
 		sleep(0.001);
 	}
 }
@@ -625,7 +790,7 @@ sub tool_start {
 	$params = {} unless ref($params) eq 'HASH';
 	$params = { map { lc($_) => $params->{$_} } keys %$params };
 	my $vm_name = $params->{vm_name};
-	my $port    = $params->{port} || $DEFAULT_VM_PORT;
+	my $port    = defined($params->{port}) && length($params->{port}) ? $params->{port} : $DEFAULT_VM_PORT;
 	my $progressToken;
 	$progressToken = $params->{_meta}{progressToken} if ref($params->{_meta}) eq 'HASH';
 	return tool_exec_error("vm_name parameter is required") unless defined $vm_name && length $vm_name;
@@ -686,48 +851,12 @@ sub tool_read {
 	my $bridge = $bridges{$vm_name};
 	my $text   = "";
 	my $total_bytes = 0;
-	# First read: open UNIX socket to establish connection
-	# Subsequent reads: read directly from bridge buffer (no socket overhead)
-	my $is_first_read = !exists $bridge->{first_read_done};
-	if ($is_first_read) {
-		my $socket_path = "/tmp/serial_${vm_name}.out";
-		my $socket = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $socket_path);
-		if ($socket) {
-			set_nonblocking($socket);
-			my $buffer      = "";
-			my $start_time  = time();
-			while (time() - $start_time < 2) {
-				my $data;
-				my $bytes = sysread($socket, $data, 4096);
-				if (!defined $bytes) {
-					if ($!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK}) {
-						sleep(0.01);
-						next;
-					}
-					debug("Error reading from output socket: $!");
-					last;
-				}
-				elsif ($bytes == 0) {
-					last;
-				}
-				else {
-					$buffer .= $data;
-					$total_bytes += $bytes;
-				}
-				sleep(0.01);
-			}
-			$socket->close();
-			eval { $text = decode_utf8($buffer, 1); 1 } or do {
-				$text = $buffer;
-				$text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge;
-				};
-		}
-		$bridge->{first_read_done} = 1;
-	}
-	# Read from bridge buffer - décoder les bytes bruts au moment de l'envoi
+	# Always read from bridge buffer - child bridge already feeds the buffer
+	# This ensures consistency: no socket vs buffer inconsistency
 	if ($bridge && $bridge->{buffer} && @{ $bridge->{buffer} }) {
 		# Joindre les bytes bruts sans diviser par \n pour préserver les séquences UTF-8 multi-octets
-		my $raw_bytes = join('', @{ $bridge->{buffer} });
+		# Déréférencer les références scalaires pour obtenir les bytes bruts
+		my $raw_bytes = join('', map { ${ $_ } } @{ $bridge->{buffer} });
 		$total_bytes = length($raw_bytes);
 		# Décoder les bytes bruts en UTF-8 uniquement au moment de l'envoi
 		eval { $text = decode_utf8($raw_bytes, 1); 1 } or do {
@@ -1083,6 +1212,7 @@ sub stop_bridge {
 	remove_socket_file("/tmp/serial_${vm_name}.out", "bridge cleanup");
 	delete $bridges{$vm_name};
 	delete $restart_guard{$vm_name};
+	delete $restart_backoff{$vm_name};
 	return $term_pid;
 }
 sub request_bridge_restart {
@@ -1093,12 +1223,32 @@ sub request_bridge_restart {
 	return if $restart_guard{$vm_name};
 	$restart_guard{$vm_name} = time();
 	$bridge->{restarting} = 1;
+	
+	# Get or initialize exponential backoff for this VM
+	my $current_backoff = $restart_backoff{$vm_name} // $RESTART_BACKOFF_INITIAL;
+	debug("Restart requested for $vm_name: $reason (backoff: ${current_backoff}s)");
+	
 	my $port     = $bridge->{port};
 	my $term_pid = $bridge->{terminal_pid};
-	debug("Restart requested for $vm_name: $reason");
 	stop_bridge($vm_name, 0);
-	sleep($RESTART_BACKOFF);
-	start_bridge($vm_name, $port, undef, $term_pid);
+	sleep($current_backoff);
+	
+	# Start bridge and check if successful
+	my $start_result = start_bridge($vm_name, $port, undef, $term_pid);
+	
+	# If bridge started successfully (has success => true), reset the exponential backoff
+	# Otherwise, double the backoff for next attempt (capped at max)
+	my $is_success = ref($start_result) eq 'HASH' && $start_result->{success};
+	if ($is_success) {
+		$restart_backoff{$vm_name} = $RESTART_BACKOFF_INITIAL;  # Reset to initial
+		debug("Bridge restarted successfully for $vm_name, backoff reset to ${RESTART_BACKOFF_INITIAL}s");
+	} else {
+		my $next_backoff = $current_backoff * 2;
+		$next_backoff = $RESTART_BACKOFF_MAX if $next_backoff > $RESTART_BACKOFF_MAX;
+		$restart_backoff{$vm_name} = $next_backoff;
+		debug("Bridge restart failed for $vm_name, backoff increased to ${next_backoff}s");
+	}
+	
 	delete $restart_guard{$vm_name};
 }
 sub monitor_bridge {
@@ -1112,13 +1262,14 @@ sub monitor_bridge {
 			debug("Monitor: Read $bytes bytes from VM via output PTY");
 			send_vm_output_notification($vm_name, "stdout", $buffer);
 			# Stocker uniquement les bytes bruts dans le buffer pour préserver les séquences UTF-8 multi-octets
+			# Stocker comme référence scalaire pour empêcher Perl de faire un upgrade UTF-8 implicite
 			# Ne pas diviser par \n pour éviter de casser les séquences multi-octets
-			push @{ $bridge->{buffer} }, $buffer;
+			push @{ $bridge->{buffer} }, \$buffer;
 			$bridge->{buffer_bytes} += $bytes;
 			# Gérer la taille du buffer en supprimant les éléments les plus anciens si nécessaire
 			while (@{ $bridge->{buffer} } > $RING_BUFFER_SIZE || $bridge->{buffer_bytes} > $MAX_BUFFER_BYTES) {
-				my $removed = shift @{ $bridge->{buffer} };
-				$bridge->{buffer_bytes} -= length($removed) if defined $removed;
+				my $removed_ref = shift @{ $bridge->{buffer} };
+				$bridge->{buffer_bytes} -= bytes::length(${ $removed_ref }) if defined $removed_ref;
 			}
 			for my $cid (keys %{ $bridge->{session}{clients} }) {
 				my $client = $bridge->{session}{clients}{$cid};
@@ -1156,7 +1307,8 @@ sub monitor_bridge {
 					? @{ $bridge->{buffer} } - $CONSOLE_HISTORY_LINES
 					: 0;
 				# Joindre les bytes bruts sans diviser par \n pour préserver les séquences UTF-8 multi-octets
-				my $raw_bytes = join('', @{ $bridge->{buffer} }[$start .. $#{ $bridge->{buffer} }]);
+				# Déréférencer les références scalaires pour obtenir les bytes bruts
+				my $raw_bytes = join('', map { ${ $_ } } @{ $bridge->{buffer} }[$start .. $#{ $bridge->{buffer} }]);
 				# Encoder directement les bytes bruts sans décodage UTF-8 intermédiaire
 				unless (write_all_nonblocking($client, $raw_bytes, 1.0)) {
 					$bridge->{select}->remove($client);
@@ -1228,8 +1380,6 @@ sub cleanup {
 		terminate_process($b->{terminal_pid}, "terminal $vm (force)") if $b && $b->{terminal_pid};
 	}
 	cleanup_all_socket_files();
-	# Remove END protection so we don't recurse if END calls us again
-	undef $PARENT_PID if defined $PARENT_PID;
 	debug("Cleanup completed");
 	# Let normal exit happen - do NOT call exit() here
 }
@@ -1318,6 +1468,7 @@ sub spawn_terminal_client {
 		setpgrp($pid, $pid);
 	}
 	if ($pid == 0) {
+		$IS_PARENT = 0;  # Prevent cleanup in child
 		setsid();
 		my ($bin, @prefix) = @$terminal_config;
 		if ($bin eq 'open') {
