@@ -59,7 +59,6 @@ our $PARENT_PID         = $$;
 our $IS_PARENT          = 1;
 our $client_initialized = 0;
 our @created_socket_files = ();
-
 # Write buffer system for truly non-blocking writes
 # Each entry: { buffer => [], buffer_bytes => 0, fileno => int }
 our %write_buffers;
@@ -301,26 +300,20 @@ sub write_all_nonblocking {
 	my ($fh, $data, $timeout, $mode) = @_;
 	$timeout = 2.0 unless defined $timeout;  # Default 2s timeout for backward compatibility
 	$mode    = 2 unless defined $mode;        # Default to legacy timeout mode for backward compatibility
-
 	return 1 unless defined $fh;
 	return 1 unless defined $data;
 	return 1 unless length $data;
-
 	my $fd = fileno($fh);
 	return 0 unless defined $fd;
-
 	# Mode 2: Legacy timeout-based retry (original behavior, kept for compatibility)
 	if ($mode == 2) {
 		return _write_all_timeout($fh, $data, $timeout) if $timeout > 0;
 	}
-
 	# Try immediate non-blocking write first
 	my $written = syswrite($fh, $data, length($data));
-
 	if (defined $written) {
 		# All data written
 		return 1 if $written == length($data);
-
 		# Partial write - handle based on mode
 		if ($mode == 0) {
 			# Pure non-blocking: return how many bytes were written
@@ -330,7 +323,6 @@ sub write_all_nonblocking {
 		my $remaining = substr($data, $written);
 		return _queue_write_buffer($fh, $remaining, $fd);
 	}
-
 	# Write failed
 	if ($!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK}) {
 		if ($mode == 0) {
@@ -340,11 +332,9 @@ sub write_all_nonblocking {
 		# Buffered mode: queue the data
 		return _queue_write_buffer($fh, $data, $fd);
 	}
-
 	# Real error
 	return 0;
 }
-
 # Internal: Legacy timeout-based write (original implementation)
 sub _write_all_timeout {
 	my ($fh, $data, $timeout) = @_;
@@ -377,20 +367,17 @@ sub _write_all_timeout {
 	}
 	return 1;
 }
-
 # Internal: Queue data into write buffer for async processing
 sub _queue_write_buffer {
 	my ($fh, $data, $fd) = @_;
 	return 0 unless defined $data && length $data;
 	$fd = fileno($fh) unless defined $fd;
 	return 0 unless defined $fd;
-
 	# Check buffer limit
 	if ($write_buffers{$fd}{buffer_bytes} && $write_buffers{$fd}{buffer_bytes} >= $MAX_WRITE_BUFFER_BYTES) {
 		warn "Write buffer full for fd $fd, dropping data" if should_log('debug');
 		return 0;
 	}
-
 	# Initialize buffer if needed
 	unless (exists $write_buffers{$fd}) {
 		$write_buffers{$fd} = {
@@ -398,36 +385,28 @@ sub _queue_write_buffer {
 			buffer       => [],
 			buffer_bytes => 0,
 			fileno       => $fd,
-		};
+			};
 	}
-
 	# Add to queue
 	push @{ $write_buffers{$fd}{buffer} }, $data;
 	$write_buffers{$fd}{buffer_bytes} += length($data);
-
 	return 1;  # Successfully queued
 }
-
 # Flush pending write buffers for a specific filehandle or all buffers
 # Returns: number of bytes written across all flushes
 sub flush_write_buffers {
 	my ($fd) = @_;
 	my $total_written = 0;
-
 	my @fds_to_process = defined $fd ? ($fd) : keys %write_buffers;
-
 	for my $flush_fd (@fds_to_process) {
 		next unless exists $write_buffers{$flush_fd};
 		next unless @{ $write_buffers{$flush_fd}{buffer} };
-
 		my $buf_ref = $write_buffers{$flush_fd};
 		my $fh = $buf_ref->{fh};
-
 		# Process buffer queue
 		while (@{ $buf_ref->{buffer} }) {
 			my $data = $buf_ref->{buffer}[0];  # Peek at first item
 			my $written = syswrite($fh, $data, length($data));
-
 			if (defined $written) {
 				if ($written == length($data)) {
 					# Fully written - remove from queue
@@ -452,19 +431,15 @@ sub flush_write_buffers {
 				last;
 			}
 		}
-
 		# Clean up empty buffers
 		delete $write_buffers{$flush_fd} unless @{ $buf_ref->{buffer} };
 	}
-
 	return $total_written;
 }
-
 # Get write buffer status for diagnostics
 sub get_write_buffer_status {
 	my ($fd) = @_;
 	return unless %write_buffers;
-
 	my @status;
 	for my $buf_fd (keys %write_buffers) {
 		next if defined $fd && $buf_fd != $fd;
@@ -472,7 +447,7 @@ sub get_write_buffer_status {
 			fileno       => $buf_fd,
 			buffer_items => scalar(@{ $write_buffers{$buf_fd}{buffer} }),
 			buffer_bytes => $write_buffers{$buf_fd}{buffer_bytes},
-		};
+			};
 	}
 	return @status;
 }
@@ -589,10 +564,8 @@ sub start_mcp_server {
 				monitor_bridge($vm_name, $fh);
 			}
 		}
-
 		# Flush pending write buffers (non-blocking, async writes)
 		flush_write_buffers() if %write_buffers;
-
 		sleep(0.001);
 	}
 }
@@ -1223,19 +1196,15 @@ sub request_bridge_restart {
 	return if $restart_guard{$vm_name};
 	$restart_guard{$vm_name} = time();
 	$bridge->{restarting} = 1;
-	
 	# Get or initialize exponential backoff for this VM
 	my $current_backoff = $restart_backoff{$vm_name} // $RESTART_BACKOFF_INITIAL;
 	debug("Restart requested for $vm_name: $reason (backoff: ${current_backoff}s)");
-	
 	my $port     = $bridge->{port};
 	my $term_pid = $bridge->{terminal_pid};
 	stop_bridge($vm_name, 0);
 	sleep($current_backoff);
-	
 	# Start bridge and check if successful
 	my $start_result = start_bridge($vm_name, $port, undef, $term_pid);
-	
 	# If bridge started successfully (has success => true), reset the exponential backoff
 	# Otherwise, double the backoff for next attempt (capped at max)
 	my $is_success = ref($start_result) eq 'HASH' && $start_result->{success};
@@ -1248,7 +1217,6 @@ sub request_bridge_restart {
 		$restart_backoff{$vm_name} = $next_backoff;
 		debug("Bridge restart failed for $vm_name, backoff increased to ${next_backoff}s");
 	}
-	
 	delete $restart_guard{$vm_name};
 }
 sub monitor_bridge {
@@ -1408,7 +1376,7 @@ sub cleanup_all_socket_files {
 	for my $path (@potential_orphans) {
 		next unless defined $path && length $path;
 		next unless -S $path;           # only actual sockets
-		# Test whether the socket appears to be in use
+		 # Test whether the socket appears to be in use
 		my $is_alive = 0;
 		eval {
 			my $test_sock = IO::Socket::UNIX->new(
