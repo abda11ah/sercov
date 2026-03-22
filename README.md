@@ -14,7 +14,7 @@ It uses `IO::Pty` to create a pseudo-terminal (PTY) for the VM serial console. I
 - **Ring Buffer**: Maintains a ring buffer of the last 1000 lines of output (10MB max per VM).
 - **Multi-Client Access**: Supports multiple simultaneous clients via dedicated Unix sockets for input (`/tmp/serial_${VM_NAME}.in`) and output (`/tmp/serial_${VM_NAME}.out`).
 - **Standard MCP**: Supports standard `tools/list` and `tools/call` methods for tool discovery and execution.
-- **Subscribe/Unsubscribe**: Control live VM output notifications with subscribe and unsubscribe tools.
+- **Resource Subscriptions**: Control live VM output notifications using standard MCP `resources/subscribe` and `resources/unsubscribe` methods.
 - **Process Reaping**: Built-in SIGCHLD handler prevents zombie processes from forks.
 - **Non-Blocking Write System**: Truly non-blocking writes with optional buffer queue for reliable data delivery.
 - **Configurable Log Levels**: Debug, info, and error log levels with priority-based filtering.
@@ -23,7 +23,8 @@ It uses `IO::Pty` to create a pseudo-terminal (PTY) for the VM serial console. I
 
 ## Prerequisites
 - **Operating System**: Strictly requires a *nix-like system (Linux, macOS, BSD, etc.). Windows is NOT supported (unless via WSL).
-- Perl with `IO::Pty`, `JSON::PP`, `IO::Socket::INET`, and `Time::HiRes` modules installed.
+- **Perl Modules**: The following non-core modules are required:
+  - `IO::Pty` - Pseudo-terminal creation
 - VM running with serial console on a TCP port (default starts at 4555).
 - It does not require root permissions.
 - **Automatic Terminal Feature**: Requires a supported terminal emulator to automatically spawn a window. It uses an internal client mode and does **not** require `socat`.
@@ -158,9 +159,9 @@ Executes a specific tool.
 
 ## Live Output Notifications
 
-The server supports real-time VM output streaming through MCP protocol notifications. This provides immediate feedback without requiring polling.
+The server supports real-time VM output streaming through MCP protocol notifications and resource subscriptions. This provides immediate feedback without requiring polling.
 
-The MCP client should use the `subscribe` tool to start receiving VM output notifications, and `unsubscribe` to stop receiving them.
+The MCP client should use the standard MCP `resources/subscribe` method to start receiving VM output notifications, and `resources/unsubscribe` to stop receiving them.
 
 ### VM Output Notifications
 VM output is automatically streamed as JSON-RPC 2.0 notifications using the MCP resources pattern:
@@ -197,7 +198,7 @@ The server supports configurable log levels: `debug`, `info`, and `error`. By de
 
 All tools include enhanced MCP annotations for better UI integration (title, readOnlyHint, destructiveHint, idempotentHint, openWorldHint).
 
-The server provides 8 tools for VM serial console management:
+The server provides 5 tools for VM serial console management. Live VM output notifications are controlled via standard MCP `resources/subscribe` and `resources/unsubscribe` methods (not separate tools).
 
 ### 1. `start`
 Starts the bridge for a specific VM. If a bridge already exists, it is restarted to ensure a **clean slate** with fresh exponential backoff state.
@@ -232,25 +233,6 @@ Stops the bridge for a specific VM, cleaning up all PTYs, child processes, and t
 - **Arguments**: `{"vm_name": "string"}`
 - **Returns**: `{"success": true/false, "message": "..."}`
 - **Annotations**: Destructive (stops bridge), idempotent, closed world
-
-### 6. `subscribe`
-Subscribe to live VM output notifications. Output is streamed via notifications/resources/updated in real-time.
-- **Arguments**: `{"vm_name": "string"}`
-- **Returns**: `{"success": true, "message": "Subscribed to VM output"}`
-- **Annotations**: Non-destructive, idempotent, open world
-
-### 7. `unsubscribe`
-Unsubscribe from VM live output notifications.
-- **Arguments**: `{"vm_name": "string"}`
-- **Returns**: `{"success": true, "message": "Unsubscribed from VM output"}`
-- **Annotations**: Non-destructive, idempotent, open world
-
-### 8. `wait_for_output`
-Wait for new VM output to arrive. This tool blocks until new data is available from the VM serial console or the timeout is reached. It is useful for synchronous waiting when you need to wait for a command response before proceeding.
-- **Arguments**: `{"vm_name": "string", "timeout": "number"}` (timeout is optional, default: 10 seconds)
-- **Returns**: `{"success": true, "output": "...", "timed_out": false}` or `{"success": true, "output": "", "timed_out": true}`
-- **Example**: `tools/call {"name": "wait_for_output", "arguments": {"vm_name": "MYVM", "timeout": 5}}`
-- **Annotations**: Non-destructive, idempotent, open world
 
 ## Architecture
 
@@ -397,9 +379,10 @@ Then check the following environment variables are properly set:
 
 - **Failed to get tools**: Ensure the script is run in an environment where standard input/output is captured. Use `tools/list` to verify connectivity.
 - **Bridge not running**: Call `start` before attempting to read or write.
-- **No live notifications**: Ensure your MCP client supports notification handling. Notifications are sent automatically when VM output is received.
+- **No live notifications**: Ensure your MCP client supports notification handling. Notifications are sent automatically when VM output is received. Use standard MCP `resources/subscribe` method to subscribe to `vm://<vm_name>/output` resources.
 - **Socket Permission**: Ensure `/tmp` is writable by the user running the MCP server.
 - **Syntax Check**: Run `perl -c serencp.pl` to verify script integrity.
+- **The MCP server failed to start**: Check that all required Perl modules are loaded. Run `perl -c serencp.pl` to verify syntax and module loading. If you see "Can't locate ... in @INC", install the missing module (e.g., `cpan IO::Pty` for non-core modules).
 - **Write buffer full**: If you see "Write buffer full" warnings, the destination is not keeping up with data. This is normal during high-throughput scenarios and data will be dropped.
 - **Exponential backoff active**: If the bridge keeps restarting, you'll see increasing delays between reconnection attempts (1s, 2s, 4s... up to 60s). This is intentional to prevent connection storms.
 

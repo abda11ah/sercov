@@ -208,18 +208,6 @@ my %TOOLS = (
 			required => ["vm_name", "text"],
 			},
 		handler => \&tool_write,
-		},
-	wait_for_output => {
-		description => "Wait for new VM output (blocks until data available or timeout)",
-		inputSchema => {
-			type       => "object",
-			properties => {
-				vm_name => { type => "string", description => "Name of the VM" },
-				timeout => { type => "number", description => "Max seconds to wait (default: 10)" },
-				},
-			required => ["vm_name"],
-			},
-		handler => \&tool_wait_for_output,
 		}
 	);
 start_mcp_server() unless caller;
@@ -907,86 +895,6 @@ sub tool_read {
 	$bridge->{buffer_bytes} = 0;
 	debug("Read completed: $total_bytes bytes from VM output");
 	return { success => JSON::PP::true, output => $text };
-}
-sub tool_wait_for_output {
-	my ($params) = @_;
-	$params = {} unless ref($params) eq 'HASH';
-	$params = { map { lc($_) => $params->{$_} } keys %$params };
-	my $vm_name = $params->{vm_name};
-	my $timeout = $params->{timeout} // 10;
-	$timeout = 30 if $timeout > 30;  # cap at 30s
-	return tool_exec_error("vm_name parameter is required")
-		unless defined $vm_name && length $vm_name;
-	return tool_exec_error("Bridge not running for VM: $vm_name")
-		unless bridge_exists($vm_name);
-	my $bridge = $bridges{$vm_name};
-	my $initial_count = $bridge->{total_bytes_received} // 0;
-	my $progressToken;
-	$progressToken = $params->{_meta}{progressToken}
-		if ref($params->{_meta}) eq 'HASH';
-	my $start = time();
-	my $last_progress = 0;
-	while (time() - $start < $timeout) {
-		# Process bridge IO while waiting
-		if ($bridge->{select}) {
-			my @ready = $bridge->{select}->can_read(0.1);
-			for my $fh (@ready) {
-				monitor_bridge($vm_name, $fh);
-			}
-		}
-		# Check if new data arrived
-		$bridge = $bridges{$vm_name};
-		last unless $bridge;  # bridge was stopped
-		my $current_count = $bridge->{total_bytes_received} // 0;
-		if ($current_count > $initial_count) {
-			# New data available, return it
-			my $text = "";
-			if (@{ $bridge->{buffer} }) {
-				my $raw_bytes = join('', map { $$_ } @{ $bridge->{buffer} });
-				eval { $text = decode_utf8($raw_bytes, 1); 1 } or do {
-					$text = $raw_bytes;
-					$text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge;
-					};
-			}
-			# Clear buffer
-			@{ $bridge->{buffer} } = ();
-			$bridge->{buffer_bytes} = 0;
-			return {
-				success    => JSON::PP::true,
-				output     => $text,
-				bytes_new  => $current_count - $initial_count,
-				waited     => sprintf("%.1f", time() - $start),
-				};
-		}
-		# Send progress if token available
-		if ($progressToken && time() - $last_progress >= 2) {
-			my $elapsed = int(time() - $start);
-			send_progress_notification(
-				$progressToken, $elapsed, $timeout,
-				"Waiting for VM output..."
-				);
-			$last_progress = time();
-		}
-		flush_write_buffers() if %write_buffers;
-	}
-	# Timeout — return whatever is buffered
-	my $text = "";
-	$bridge = $bridges{$vm_name};
-	if ($bridge && @{ $bridge->{buffer} }) {
-		my $raw_bytes = join('', map { $$_ } @{ $bridge->{buffer} });
-		eval { $text = decode_utf8($raw_bytes, 1); 1 } or do {
-			$text = $raw_bytes;
-			$text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge;
-			};
-		@{ $bridge->{buffer} } = ();
-		$bridge->{buffer_bytes} = 0;
-	}
-	return {
-		success  => JSON::PP::true,
-		output   => $text,
-		timeout  => JSON::PP::true,
-		waited   => sprintf("%.1f", time() - $start),
-		};
 }
 sub tool_write {
 	my ($params) = @_;
