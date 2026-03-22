@@ -264,12 +264,29 @@ sub boot_linux {
     print $client encode_utf8("║           Linux Boot Complete - Login Prompt               ║\n");
     print $client encode_utf8("╚════════════════════════════════════════════════════════════╝\n");
     print $client "\n";
-    print $client "mockvm login: _\n";
+    print $client "mockvm login: ";
     
-    # Keep connection alive indefinitely - only close on signal or explicit exit
-    # Use a loop that just sleeps and doesn't try to read
     while (1) {
-        Time::HiRes::sleep(1);
+        my $input;
+        eval {
+            local $SIG{ALRM} = sub { die "timeout\n" };
+            alarm(30);
+            $input = <$client>;
+            alarm(0);
+        };
+        
+        if (!defined($input) || $@ eq "timeout\n") {
+            last;
+        }
+        
+        $input =~ s/[\r\n]//g;
+        
+        if ($input =~ /^(root|admin|user)$/i) {
+            print $client "\nPassword: ";
+        } else {
+            print $client "You entered: $input\n";
+            print $client "mockvm login: ";
+        }
     }
 }
     
