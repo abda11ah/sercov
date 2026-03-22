@@ -528,20 +528,6 @@ sub flush_write_buffers {
 	}
 	return $total_written;
 }
-sub get_write_buffer_status {
-	my ($fd) = @_;
-	return unless %write_buffers;
-	my @status;
-	for my $buf_fd (keys %write_buffers) {
-		next if defined $fd && $buf_fd != $fd;
-		push @status, {
-			fileno       => $buf_fd,
-			buffer_items => scalar(@{ $write_buffers{$buf_fd}{buffer} }),
-			buffer_bytes => $write_buffers{$buf_fd}{buffer_bytes},
-			};
-	}
-	return @status;
-}
 sub set_nonblocking {
 	my ($fh) = @_;
 	my $flags = fcntl($fh, F_GETFL, 0);
