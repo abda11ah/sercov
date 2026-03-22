@@ -25,7 +25,7 @@ if ($options{'socket'}) {
 	run_unix_socket_client($socket_path);
 	exit 0;
 }
-our $VERSION               = "1.1";
+our $VERSION               = "1.2 experimental";
 our $PROTOCOL_VERSION      = "2025-11-25";
 our $DEFAULT_VM_PORT       = 4555;
 our $RING_BUFFER_SIZE      = 1000;
@@ -527,20 +527,6 @@ sub flush_write_buffers {
 		delete $write_buffers{$flush_fd} unless @{ $buf_ref->{buffer} };
 	}
 	return $total_written;
-}
-sub get_write_buffer_status {
-	my ($fd) = @_;
-	return unless %write_buffers;
-	my @status;
-	for my $buf_fd (keys %write_buffers) {
-		next if defined $fd && $buf_fd != $fd;
-		push @status, {
-			fileno       => $buf_fd,
-			buffer_items => scalar(@{ $write_buffers{$buf_fd}{buffer} }),
-			buffer_bytes => $write_buffers{$buf_fd}{buffer_bytes},
-			};
-	}
-	return @status;
 }
 sub set_nonblocking {
 	my ($fh) = @_;

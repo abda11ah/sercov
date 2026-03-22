@@ -77,7 +77,7 @@ The detection now performs a **test launch** to verify the terminal can actually
 - **Read Timeout**: 2 seconds (internal, for legacy `read` tool)
 - **Restart Backoff**: Initial 1s, Maximum 60s (exponential backoff)
 - **Write Buffer**: 1MB max per destination
-- **Protocol Version**: 2025-11-25
+- **Protocol Version**: 2025-06-18
 
 ### MCP Server Configuration
 Make sure the MCP server is configured in `opencode.jsonc`:
