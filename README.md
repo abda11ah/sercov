@@ -4,7 +4,7 @@
 
 ## Overview
 
-The `serencp.pl` script (version 1.1) provides a standard MCP (Model Context Protocol) 1.0 server for bidirectional communication with VM serial consoles via an internal Perl-based socket bridge.
+The `serencp.pl` script provides a standard MCP (Model Context Protocol) server for bidirectional communication with VM serial consoles via an internal Perl-based socket bridge.
 
 It uses `IO::Pty` to create a pseudo-terminal (PTY) for the VM serial console. It manages multiple VMs by assigning unique TCP ports for communication and provides a high-performance multiplexed event loop.
 
@@ -14,7 +14,8 @@ It uses `IO::Pty` to create a pseudo-terminal (PTY) for the VM serial console. I
 - **Ring Buffer**: Maintains a ring buffer of the last 1000 lines of output (10MB max per VM).
 - **Multi-Client Access**: Supports multiple simultaneous clients via dedicated Unix sockets for input (`/tmp/serial_${VM_NAME}.in`) and output (`/tmp/serial_${VM_NAME}.out`).
 - **Standard MCP**: Supports standard `tools/list` and `tools/call` methods for tool discovery and execution.
-- **Zombie Management**: Built-in process reaper prevents zombie processes from forks.
+- **Subscribe/Unsubscribe**: Control live VM output notifications with subscribe and unsubscribe tools.
+- **Process Reaping**: Built-in SIGCHLD handler prevents zombie processes from forks.
 - **Non-Blocking Write System**: Truly non-blocking writes with optional buffer queue for reliable data delivery.
 - **Configurable Log Levels**: Debug, info, and error log levels with priority-based filtering.
 - **Progress Notifications**: Supports MCP progress notifications for long-running operations.
@@ -27,25 +28,25 @@ It uses `IO::Pty` to create a pseudo-terminal (PTY) for the VM serial console. I
 - It does not require root permissions.
 - **Automatic Terminal Feature**: Requires a supported terminal emulator to automatically spawn a window. It uses an internal client mode and does **not** require `socat`.
 - **Command-Line Options**:
-  - `--socket <path>`: Run in Unix socket client mode (connect to existing bridge)
-  - `--terminal <name>`: Specify terminal emulator to use (bypasses auto-detection)
+  - `--socket <path>`: Run in Unix socket client mode (connect to existing bridge) (don't care about it unless in non-MCP environement)
+  - `--terminal <name>`: Specify preferred terminal emulator to use (bypasses auto-detection)
 
 ### Supported Terminal Emulators
 
 The script automatically detects and supports the following terminal emulators (tested for availability at runtime):
 
 **macOS (Priority):**
-- `Ghostty.app` (GPU-accelerated, tested)
-- `WezTerm.app` (tested)
+- `Ghostty.app` (GPU-accelerated)
+- `WezTerm.app`
 - `iTerm.app` / `iTerm2.app`
 - `Terminal.app` (built-in macOS terminal)
 
 **Modern Linux/Unix:**
-- `wezterm` (cross-platform, tested)
+- `wezterm` (cross-platform)
 - `kitty` (GPU-accelerated, tested)
-- `alacritty` (GPU-accelerated, tested)
-- `ghostty` (modern GPU-accelerated, tested)
-- `foot` (Wayland terminal, tested)
+- `alacritty` (GPU-accelerated)
+- `ghostty` (modern GPU-accelerated)
+- `foot` (Wayland terminal)
 
 **Mid-tier:**
 - `konsole` (KDE)
@@ -64,7 +65,7 @@ The script uses a priority-based detection system:
 3. Then checks `TERMINAL` environment variable
 4. Finally tries terminals in priority order until one works
 
-The detection now performs a **test launch** to verify the terminal can actually spawn before selecting it, ensuring more reliable terminal spawning. If no terminal is detected, it provides fallback mechanisms and error notifications.
+The detection now performs a **test launch** to verify the terminal can actually spawn before selecting it, ensuring more reliable terminal spawning. If no terminal is detected, it provides fallback mechanisms and error notifications. It always prioritize best graphical terminal emulators.
 
 ## Configuration
 
@@ -159,96 +160,44 @@ Executes a specific tool.
 
 The server supports real-time VM output streaming through MCP protocol notifications. This provides immediate feedback without requiring polling.
 
+The MCP client should use the `subscribe` tool to start receiving VM output notifications, and `unsubscribe` to stop receiving them.
+
 ### VM Output Notifications
-VM output is automatically streamed as JSON-RPC 2.0 notifications:
+VM output is automatically streamed as JSON-RPC 2.0 notifications using the MCP resources pattern:
 
 ```json
 {
     "jsonrpc": "2.0",
-    "method": "notifications/message",
+    "method": "notifications/resources/updated",
     "params": {
-        "level": "info",
-        "logger": "serencp.vm.vm_name",
-        "data": {
-            "type": "vm_output",
-            "vm_name": "vm_name",
-            "stream": "stdout",
-            "content": "output data here"
-        }
+        "uri": "vm://<vm_name>/output",
+        "content": "output data here",
+        "stream": "stdout"
     }
 }
 ```
 
 ### Notification Parameters
-- **level**: Log level (info, error, debug)
-- **logger**: Identifier including VM name (e.g., "serencp.vm.myvm")
-- **data**: Object containing:
-  - **type**: Always "vm_output" for VM data
-  - **vm_name**: Name of the VM
-  - **stream**: "stdout" or "stderr"
-  - **content**: The actual output data (UTF-8 safe)
-
-### Client-Side Handling
-MCP clients can listen for notifications:
-
-```javascript
-client.on('notification', (notification) => {
-    if (notification.method === 'notifications/message' && 
-        notification.params.logger.startsWith('serencp.vm.')) {
-        const vmName = notification.params.logger.replace('serencp.vm.', '');
-        const data = notification.params.data;
-        if (data.type === 'vm_output') {
-            console.log(`[${vmName}]: ${data.content}`);
-            // Render live output to UI
-        }
-    }
-});
-```
+- **uri**: Resource URI in the format `vm://<vm_name>/output`
+- **content**: The actual output data (UTF-8 safe)
+- **stream**: "stdout" or "stderr"
 
 ### Benefits
 - **Real-time Feedback**: VM output appears immediately without polling
 - **Efficient**: Push-based model reduces overhead compared to polling
 - **UTF-8 Safe**: Binary data is converted to UTF-8 with escaped representations for non-printable characters
 - **Backward Compatible**: Existing `read` tool continues to work for pull-based access
-- **Structured Data**: VM output notifications include stream type and VM name
+- **MCP Resources Pattern**: Uses standardized `notifications/resources/updated` for VM output
+- **URI-based Access**: VM output accessible via `vm://<vm_name>/output` resource URI
 
 ### Log Level Control
 The server supports configurable log levels: `debug`, `info`, and `error`. By default, debug logging is enabled.
 
-### `notifications/message`
-The server sends all log messages for errors, warnings, debug info (if enabled), and VM output using the standardized MCP logging notification. This is the preferred way for clients to receive live updates.
-
-```json
-{
-    "jsonrpc": "2.0",
-    "method": "notifications/message",
-    "params": {
-        "level": "info", // or "error", "debug"
-        "logger": "serencp", // or "serencp.vm.vm1" for VM output
-        "data": "Description of the event or raw VM output"
-    }
-}
-```
-
-### `notifications/progress`
-The server supports MCP progress notifications for tracking long-running operations:
-
-```json
-{
-    "jsonrpc": "2.0",
-    "method": "notifications/progress",
-    "params": {
-        "progressToken": "unique-token",
-        "progress": 50,
-        "total": 100,
-        "message": "Processing..."
-    }
-}
-```
-
 ## Available Tools
 
 All tools include enhanced MCP annotations for better UI integration (title, readOnlyHint, destructiveHint, idempotentHint, openWorldHint).
+
+The server provides 7 tools for VM serial console management:
 
 ### 1. `start`
 Starts the bridge for a specific VM. If a bridge already exists, it is restarted to ensure a **clean slate** with fresh exponential backoff state.
@@ -284,11 +233,21 @@ Stops the bridge for a specific VM, cleaning up all PTYs, child processes, and t
 - **Returns**: `{"success": true/false, "message": "..."}`
 - **Annotations**: Destructive (stops bridge), idempotent, closed world
 
+### 6. `subscribe`
+Subscribe to live VM output notifications. Output is streamed via notifications/resources/updated in real-time.
+- **Arguments**: `{"vm_name": "string"}`
+- **Returns**: `{"success": true, "message": "Subscribed to VM output"}`
+- **Annotations**: Non-destructive, idempotent, open world
+
+### 7. `unsubscribe`
+Unsubscribe from VM live output notifications.
+- **Arguments**: `{"vm_name": "string"}`
+- **Returns**: `{"success": true, "message": "Unsubscribed from VM output"}`
+- **Annotations**: Non-destructive, idempotent, open world
+
 ## Architecture
 
 The script connects to the VM serial console as a client and provides two Unix socket servers: one for input at `/tmp/serial_${VM_NAME}.in` and one for output at `/tmp/serial_${VM_NAME}.out`. It supports both an internal Unix socket client mode and automatic terminal spawning. The MCP server handles JSON-RPC commands and replies via MCP-compliant notifications.
-
-### New Features in Version 1.1
 
 #### Exponential Backoff Restart
 When a VM disconnects, the bridge now uses exponential backoff to prevent reconnection storms:
@@ -436,31 +395,6 @@ Then check the following environment variables are properly set:
 - **Syntax Check**: Run `perl -c serencp.pl` to verify script integrity.
 - **Write buffer full**: If you see "Write buffer full" warnings, the destination is not keeping up with data. This is normal during high-throughput scenarios and data will be dropped.
 - **Exponential backoff active**: If the bridge keeps restarting, you'll see increasing delays between reconnection attempts (1s, 2s, 4s... up to 60s). This is intentional to prevent connection storms.
-
-## Version History
-
-### Version 1.1 (2025-11-25)
-- Added exponential backoff for VM reconnection (prevents connection storms)
-- Added non-blocking write system with buffer queue
-- Added configurable log levels (debug, info, error)
-- Added MCP progress notifications support
-- Added `--terminal` option for explicit terminal selection
-- Enhanced terminal detection with test launch verification
-- Added tool annotations for better MCP client integration
-- Added robust END block cleanup
-- Added per-VM restart backoff state tracking
-- Enhanced UTF-8 handling with safe binary data conversion
-- Added socket file tracking for cleanup
-- Protocol version: 2025-11-25
-
-### Version 1.0.1 (2025-06-18)
-- Initial release with basic MCP server functionality
-- Persistent PTY with auto-restart
-- Ring buffer for output
-- Unix socket-based multi-client access
-- Automatic terminal spawning
-- Live output notifications
-- Protocol version: 2025-06-18
 
 ## About
 
