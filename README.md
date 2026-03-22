@@ -321,6 +321,8 @@ New output connections automatically receive the last 60 lines of history. Live 
 
 ## Troubleshooting
 - **No terminal window is opened**: If the automatic terminal spawning fails, check the following environment variables are properly set:
+  First check if graphical apps can be launched from a root terminal (e.g : `pluma`)
+Then check correct values for these env vars :
   - **XAUTHORITY**: Required for X11 authentication (e.g., `/root/.Xauthority`)
   - **XDG_RUNTIME_DIR**: Should be set to the user's runtime directory (e.g., `/run/user/0`)
   - **DBUS_SESSION_BUS_ADDRESS**: Required for D-Bus session communication
