@@ -15,7 +15,7 @@ use Errno qw(EAGAIN EWOULDBLOCK EINTR EPIPE);
 use Getopt::Long;
 use Time::HiRes qw(sleep time);
 our %options;
-GetOptions(\%options, 'socket=s') or exit 1;
+GetOptions(\%options, 'socket=s', 'terminal=s') or exit 1;
 if ($options{'socket'}) {
 	my $socket_path = $options{'socket'};
 	if (!$socket_path) {
@@ -70,33 +70,14 @@ sub detect_terminal {
 	# Helper: Try to launch silently and quickly; returns 1 on apparent success
 	my $test_launch = sub {
 		my ($cmd) = @_;
-		my $MAX_TEST_TIME = 1;           # seconds — hard cap per candidate
+		my $MAX_TEST_TIME = 1; # seconds — hard cap per candidate
 		return 0 unless @$cmd && can_run($cmd->[0]);
 		eval {
 			local $SIG{ALRM} = sub { die "TIMEOUT\n" };
 			alarm($MAX_TEST_TIME);
-			my @test_cmd = @$cmd;
-			# Determine the correct exec flag based on terminal type
-			my $exec_flag = '-e';
-			my $terminal = $cmd->[0];
-			if ($terminal eq 'wezterm') {
-				# wezterm uses 'start' plus optional '--' for commands
-				$exec_flag = 'start';
-			} elsif ($terminal eq 'xfce4-terminal') {
-				$exec_flag = '--command';
-			} elsif ($terminal eq 'gnome-terminal') {
-				$exec_flag = '--';
-			} elsif ($terminal eq 'konsole') {
-				$exec_flag = '-e';
-			} elsif ($terminal eq 'kitty') {
-				# kitty uses no flag, just the command directly
-				# But we need to handle differently
-				@test_cmd = ($terminal, 'true');
-				goto TEST;
-			}
-			# For terminals that need a flag
-			push @test_cmd, $exec_flag, 'true';
-			TEST:
+			# FIX: The $cmd array already includes the execution flags 
+			# (e.g. '-e', '--', '-x'). We just append the test command.
+			my @test_cmd = (@$cmd, 'true');
 			my $pid = fork();
 			return 0 unless defined $pid;
 			if ($pid == 0) {
@@ -115,7 +96,7 @@ sub detect_terminal {
 		return 0 if $@;
 		return 1;
 		};
-	# Single source-of-truth priority list (no special cases)
+	# Single source-of-truth priority list
 	my @priority_terminals = (
 		# macOS-specific
 		{   name    => 'Ghostty.app',
@@ -135,21 +116,39 @@ sub detect_terminal {
 			check   => sub { -d "/Applications/Terminal.app" },
 		},
 		# Modern terminals
-		{   name    => 'wezterm', config  => ['wezterm', 'start', '--'], check => sub { can_run('wezterm') && $test_launch->($_[0]) } },
-		{   name    => 'kitty',    config  => ['kitty'],     check => sub { can_run('kitty')    && $test_launch->($_[0]) } },
-		{   name    => 'alacritty',config  => ['alacritty', '-e'], check => sub { can_run('alacritty') && $test_launch->($_[0]) } },
-		{   name    => 'ghostty',  config  => ['ghostty', '-e'], check => sub { can_run('ghostty')  && $test_launch->($_[0]) } },
-		{   name    => 'foot',     config  => ['foot', '-e'],      check => sub { can_run('foot')     && $test_launch->($_[0]) } },
+		{   name    => 'wezterm',   config => ['wezterm', 'start', '--'], check => sub { can_run('wezterm')   && $test_launch->($_[0]) } },
+		{   name    => 'kitty',     config => ['kitty', '--'],            check => sub { can_run('kitty')     && $test_launch->($_[0]) } },
+		{   name    => 'alacritty', config => ['alacritty', '-e'],        check => sub { can_run('alacritty') && $test_launch->($_[0]) } },
+		{   name    => 'ghostty',   config => ['ghostty', '-e'],          check => sub { can_run('ghostty')   && $test_launch->($_[0]) } },
+		{   name    => 'foot',      config => ['foot'],                   check => sub { can_run('foot')      && $test_launch->($_[0]) } },
 		# Mid-tier
-		{   name    => 'konsole',     config  => ['konsole', '-e'],       check => sub { can_run('konsole')     && $test_launch->($_[0]) } },
-		{   name    => 'gnome-terminal', config  => ['gnome-terminal', '-e'], check => sub { can_run('gnome-terminal') && $test_launch->($_[0]) } },
-		{   name    => 'tilix',       config  => ['tilix', '-e'],         check => sub { can_run('tilix')       && $test_launch->($_[0]) } },
-		{   name    => 'terminator',  config  => ['terminator', '-e'],    check => sub { can_run('terminator')  && $test_launch->($_[0]) } },
-		{   name    => 'xfce4-terminal', config => ['xfce4-terminal', '--command'], check => sub { can_run('xfce4-terminal') && $test_launch->($_[0]) } },
+		{   name    => 'konsole',        config => ['konsole', '-e'],        check => sub { can_run('konsole')        && $test_launch->($_[0]) } },
+		{   name    => 'gnome-terminal', config => ['gnome-terminal', '--'], check => sub { can_run('gnome-terminal') && $test_launch->($_[0]) } },
+		{   name    => 'tilix',          config => ['tilix', '-e'],          check => sub { can_run('tilix')          && $test_launch->($_[0]) } },
+		{   name    => 'terminator',     config => ['terminator', '-x'],     check => sub { can_run('terminator')     && $test_launch->($_[0]) } },
+		{   name    => 'xfce4-terminal', config => ['xfce4-terminal', '-x'], check => sub { can_run('xfce4-terminal') && $test_launch->($_[0]) } },
 		# Legacy
-		{   name    => 'xterm',  config  => ['xterm', '-e'],  check => sub { can_run('xterm')  && $test_launch->($_[0]) } },
-		{   name    => 'urxvt',  config  => ['urxvt', '-e'],  check => sub { can_run('urxvt')  && $test_launch->($_[0]) } },
+		{   name    => 'xterm',  config => ['xterm', '-e'], check => sub { can_run('xterm') && $test_launch->($_[0]) } },
+		{   name    => 'urxvt',  config => ['urxvt', '-e'], check => sub { can_run('urxvt') && $test_launch->($_[0]) } },
 		);
+	# 0. Honor user's explicit terminal option
+	if ($options{'terminal'}) {
+		my $user_terminal = $options{'terminal'};
+		my $cfg = [$user_terminal, '-e'];
+		# Adjust config based on terminal type
+		if ($user_terminal eq 'wezterm') {
+			$cfg = [$user_terminal, 'start', '--'];
+		} elsif ($user_terminal eq 'xfce4-terminal') {
+			$cfg = [$user_terminal, '--command'];
+		} elsif ($user_terminal eq 'gnome-terminal') {
+			$cfg = [$user_terminal, '--'];
+		} elsif ($user_terminal eq 'kitty') {
+			$cfg = [$user_terminal];
+		}
+		if (can_run($user_terminal) && $test_launch->($cfg)) {
+			return $cfg;
+		}
+	}
 	# 1. Honor user's explicit preference
 	if ($ENV{TERM_PROGRAM}) {
 		my %map = (
@@ -169,7 +168,9 @@ sub detect_terminal {
 		}
 	}
 	if ($ENV{TERMINAL} && can_run($ENV{TERMINAL})) {
-		my $cfg = [$ENV{TERMINAL}, '-e'];
+		# Fallback heuristic: gnome-terminal deprecated -e in favor of --
+		my $env_flag = ($ENV{TERMINAL} =~ /gnome-terminal/) ? '--' : '-e';
+		my $cfg = [$ENV{TERMINAL}, $env_flag];
 		if ($test_launch->($cfg)) {
 			return $cfg;
 		}
@@ -914,6 +915,9 @@ sub tool_read {
 			$text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge;
 			};
 	}
+	# drain the buffer before returning it to avoid stale data pollution
+	@{ $bridge->{buffer} } = ();
+	$bridge->{buffer_bytes} = 0;
 	debug("Read completed: $total_bytes bytes from VM output");
 	return { success => JSON::PP::true, output => $text };
 }

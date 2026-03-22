@@ -4,61 +4,79 @@
 
 ## Overview
 
-The `serencp.pl` script provides a standard MCP (Model Context Protocol) 1.0 server for bidirectional communication with VM serial consoles via an internal Perl-based socket bridge.
+The `serencp.pl` script (version 1.1) provides a standard MCP (Model Context Protocol) 1.0 server for bidirectional communication with VM serial consoles via an internal Perl-based socket bridge.
 
 It uses `IO::Pty` to create a pseudo-terminal (PTY) for the VM serial console. It manages multiple VMs by assigning unique TCP ports for communication and provides a high-performance multiplexed event loop.
 
 ### Core Features:
 - **Persistent PTY**: Maintains a stable connection to the VM serial console.
-- **Auto-Restart**: Automatically detects VM disconnects and restarts the bridge for persistent interaction.
+- **Auto-Restart with Exponential Backoff**: Automatically detects VM disconnects and restarts the bridge with intelligent exponential backoff (1s initial, 60s max) to prevent rapid reconnection storms.
 - **Ring Buffer**: Maintains a ring buffer of the last 1000 lines of output (10MB max per VM).
 - **Multi-Client Access**: Supports multiple simultaneous clients via dedicated Unix sockets for input (`/tmp/serial_${VM_NAME}.in`) and output (`/tmp/serial_${VM_NAME}.out`).
 - **Standard MCP**: Supports standard `tools/list` and `tools/call` methods for tool discovery and execution.
 - **Zombie Management**: Built-in process reaper prevents zombie processes from forks.
+- **Non-Blocking Write System**: Truly non-blocking writes with optional buffer queue for reliable data delivery.
+- **Configurable Log Levels**: Debug, info, and error log levels with priority-based filtering.
+- **Progress Notifications**: Supports MCP progress notifications for long-running operations.
+- **Robust Cleanup**: END block ensures proper cleanup on abnormal exit (crash, _exit, die).
 
 ## Prerequisites
 - **Operating System**: Strictly requires a *nix-like system (Linux, macOS, BSD, etc.). Windows is NOT supported (unless via WSL).
-- Perl with `IO::Pty` and `JSON::PP` modules installed.
+- Perl with `IO::Pty`, `JSON::PP`, `IO::Socket::INET`, and `Time::HiRes` modules installed.
 - VM running with serial console on a TCP port (default starts at 4555).
 - It does not require root permissions.
 - **Automatic Terminal Feature**: Requires a supported terminal emulator to automatically spawn a window. It uses an internal client mode and does **not** require `socat`.
+- **Command-Line Options**:
+  - `--socket <path>`: Run in Unix socket client mode (connect to existing bridge)
+  - `--terminal <name>`: Specify terminal emulator to use (bypasses auto-detection)
 
 ### Supported Terminal Emulators
 
-The script automatically detects and supports the following terminal emulators:
+The script automatically detects and supports the following terminal emulators (tested for availability at runtime):
 
-**Linux/Unix:**
+**macOS (Priority):**
+- `Ghostty.app` (GPU-accelerated, tested)
+- `WezTerm.app` (tested)
+- `iTerm.app` / `iTerm2.app`
+- `Terminal.app` (built-in macOS terminal)
+
+**Modern Linux/Unix:**
+- `wezterm` (cross-platform, tested)
+- `kitty` (GPU-accelerated, tested)
+- `alacritty` (GPU-accelerated, tested)
+- `ghostty` (modern GPU-accelerated, tested)
+- `foot` (Wayland terminal, tested)
+
+**Mid-tier:**
 - `konsole` (KDE)
 - `gnome-terminal` (GNOME)
-- `xterm` (classic X11 terminal)
-- `terminator` (advanced tiling terminal)
-- `guake` (drop-down terminal)
 - `tilix` (GTK3 tiling terminal)
-- `alacritty` (GPU-accelerated terminal)
-- `kitty` (GPU-accelerated terminal)
-- `urxvt` (Unicode rxvt)
+- `terminator` (advanced tiling terminal)
 - `xfce4-terminal` (XFCE desktop)
-- `lxterminal` (LXDE desktop)
-- `deepin-terminal` (Deepin desktop)
-- `mate-terminal` (MATE desktop)
-- `qterminal` (LXQt desktop)
-- `wezterm` (cross-platform terminal)
-- `ghostty` (modern GPU-accelerated terminal)
 
-**macOS:**
-- `Terminal.app` (built-in macOS terminal)
-- `iTerm.app` (iTerm2)
+**Legacy:**
+- `xterm` (classic X11 terminal)
+- `urxvt` (Unicode rxvt)
 
-The script will automatically detect which terminal is available on your system and use the appropriate command-line arguments to spawn a new terminal window connected to the VM serial console session. If no terminal is detected, it provides fallback mechanisms and error notifications.
+The script uses a priority-based detection system:
+1. First honors user's explicit `--terminal` option
+2. Then checks `TERM_PROGRAM` environment variable (macOS/VSCode/Warp/Hyper)
+3. Then checks `TERMINAL` environment variable
+4. Finally tries terminals in priority order until one works
+
+The detection now performs a **test launch** to verify the terminal can actually spawn before selecting it, ensuring more reliable terminal spawning. If no terminal is detected, it provides fallback mechanisms and error notifications.
 
 ## Configuration
 
-### Default Constants
+### Default Constants (Version 1.1)
 - **Default VM Port**: 4555
 - **Ring Buffer Size**: 1000 lines
 - **Max Buffer Bytes**: 10MB per VM
 - **Console History Lines**: 60 lines (sent to new clients)
 - **Read Timeout**: 2 seconds (internal, for legacy `read` tool)
+- **Restart Backoff**: Initial 1s, Maximum 60s (exponential backoff)
+- **Write Buffer**: 1MB max per destination
+- **Protocol Version**: 2025-11-25
 
 ### MCP Server Configuration
 Make sure the MCP server is configured in `opencode.jsonc`:
@@ -67,6 +85,17 @@ Make sure the MCP server is configured in `opencode.jsonc`:
     "serencp": {
         "type": "local",
         "command": ["perl", "/path/to/serencp.pl"],
+        "enabled": true
+    }
+}
+```
+
+You can also specify a terminal explicitly:
+```json
+"mcp": {
+    "serencp": {
+        "type": "local",
+        "command": ["perl", "/path/to/serencp.pl","--terminal","wezterm"],
         "enabled": true
     }
 }
@@ -128,43 +157,50 @@ Executes a specific tool.
 
 ## Live Output Notifications
 
-The server now supports real-time VM output streaming through MCP protocol notifications. This provides immediate feedback without requiring polling.
+The server supports real-time VM output streaming through MCP protocol notifications. This provides immediate feedback without requiring polling.
 
-### Notification Format
+### VM Output Notifications
 VM output is automatically streamed as JSON-RPC 2.0 notifications:
 
 ```json
 {
     "jsonrpc": "2.0",
-    "method": "notifications/tool_stream",
+    "method": "notifications/message",
     "params": {
-        "toolName": "serencp/vm1",
-        "content": [
-            {
-                "type": "text",
-                "text": "output data here"
-            }
-        ],
-        "isError": false
+        "level": "info",
+        "logger": "serencp.vm.vm_name",
+        "data": {
+            "type": "vm_output",
+            "vm_name": "vm_name",
+            "stream": "stdout",
+            "content": "output data here"
+        }
     }
 }
 ```
 
 ### Notification Parameters
-- **toolName**: The tool identifier in format "serencp/{vm_name}"
-- **content**: Array containing the output data with type and text fields
-- **isError**: Boolean flag indicating if this is an error message
+- **level**: Log level (info, error, debug)
+- **logger**: Identifier including VM name (e.g., "serencp.vm.myvm")
+- **data**: Object containing:
+  - **type**: Always "vm_output" for VM data
+  - **vm_name**: Name of the VM
+  - **stream**: "stdout" or "stderr"
+  - **content**: The actual output data (UTF-8 safe)
 
 ### Client-Side Handling
 MCP clients can listen for notifications:
 
 ```javascript
 client.on('notification', (notification) => {
-    if (notification.method === 'notifications/tool_stream' && notification.params.toolName.startsWith('serencp/')) {
-        const vmName = notification.params.toolName.replace('serencp/', '');
-        const content = notification.params.content[0];
-        console.log(`[${vmName}]: ${content.text}`);
-        // Render live output to UI
+    if (notification.method === 'notifications/message' && 
+        notification.params.logger.startsWith('serencp.vm.')) {
+        const vmName = notification.params.logger.replace('serencp.vm.', '');
+        const data = notification.params.data;
+        if (data.type === 'vm_output') {
+            console.log(`[${vmName}]: ${data.content}`);
+            // Render live output to UI
+        }
     }
 });
 ```
@@ -172,8 +208,12 @@ client.on('notification', (notification) => {
 ### Benefits
 - **Real-time Feedback**: VM output appears immediately without polling
 - **Efficient**: Push-based model reduces overhead compared to polling
-- **Timestamped**: Each chunk includes precise timing information
+- **UTF-8 Safe**: Binary data is converted to UTF-8 with escaped representations for non-printable characters
 - **Backward Compatible**: Existing `read` tool continues to work for pull-based access
+- **Structured Data**: VM output notifications include stream type and VM name
+
+### Log Level Control
+The server supports configurable log levels: `debug`, `info`, and `error`. By default, debug logging is enabled.
 
 ### `notifications/message`
 The server sends all log messages for errors, warnings, debug info (if enabled), and VM output using the standardized MCP logging notification. This is the preferred way for clients to receive live updates.
@@ -184,31 +224,51 @@ The server sends all log messages for errors, warnings, debug info (if enabled),
     "method": "notifications/message",
     "params": {
         "level": "info", // or "error", "debug"
-        "logger": "serencp", // or "vm/vm1" for VM output
-        "message": "Description of the event or raw VM output",
+        "logger": "serencp", // or "serencp.vm.vm1" for VM output
         "data": "Description of the event or raw VM output"
+    }
+}
+```
+
+### `notifications/progress`
+The server supports MCP progress notifications for tracking long-running operations:
+
+```json
+{
+    "jsonrpc": "2.0",
+    "method": "notifications/progress",
+    "params": {
+        "progressToken": "unique-token",
+        "progress": 50,
+        "total": 100,
+        "message": "Processing..."
     }
 }
 ```
 
 ## Available Tools
 
+All tools include enhanced MCP annotations for better UI integration (title, readOnlyHint, destructiveHint, idempotentHint, openWorldHint).
+
 ### 1. `start`
-Starts the bridge for a specific VM. If a bridge already exists, it is restarted to ensure a **clean slate**.
+Starts the bridge for a specific VM. If a bridge already exists, it is restarted to ensure a **clean slate** with fresh exponential backoff state.
 **New behavior**: Automatically spawns a graphical terminal window linked to the session using the internal client of `serencp.pl`. The PID of this terminal is stored to avoid duplicate windows.
 - **Arguments**: `{"vm_name": "string", "port": "number"}` (port is optional, default: 4555)
 - **Returns**: `{"success": true, "message": "...", "port": 4555, "socket_in": "/tmp/serial_VM_NAME.in", "socket_out": "/tmp/serial_VM_NAME.out", "session_id": "session_...", "terminal_pid": 1234}`
 - **Example**: `tools/call {"name": "start", "arguments": {"vm_name": "MYVM", "port": 4555}}`
+- **Annotations**: Non-destructive, idempotent, open world
 
 ### 2. `status`
 Checks the status of the bridge.
 - **Arguments**: `{"vm_name": "string"}`
 - **Returns**: `{"running": true/false, "vm_name": "...", "port": ..., "buffer_size": ...}`
+- **Annotations**: Read-only, closed world
 
 ### 3. `read`
-Reads all available output from the VM serial console's dedicated output Unix socket with a 2-second timeout. This is for pull-based legacy access.
+Reads all available output from the VM serial console's dedicated output Unix socket with a 2-second timeout. Live output is also streamed via notifications.
 - **Arguments**: `{"vm_name": "string"}`
 - **Returns**: `{"success": true, "output": "..."}`
+- **Annotations**: Read-only, open world
 
 ### 4. `write`
 Sends a command to the VM serial console via its dedicated input Unix socket.
@@ -216,23 +276,55 @@ Sends a command to the VM serial console via its dedicated input Unix socket.
 - **Arguments**: `{"vm_name": "string", "text": "command"}`
 - **Returns**: `{"success": true/false, "message": "..."}`
 - **Example**: `tools/call {"name": "write", "arguments": {"vm_name": "MYVM", "text": "ls -l /"}}`
+- **Annotations**: Non-destructive, non-idempotent, open world
 
 ### 5. `stop`
 Stops the bridge for a specific VM, cleaning up all PTYs, child processes, and temporary Unix sockets.
 - **Arguments**: `{"vm_name": "string"}`
 - **Returns**: `{"success": true/false, "message": "..."}`
+- **Annotations**: Destructive (stops bridge), idempotent, closed world
 
 ## Architecture
 
 The script connects to the VM serial console as a client and provides two Unix socket servers: one for input at `/tmp/serial_${VM_NAME}.in` and one for output at `/tmp/serial_${VM_NAME}.out`. It supports both an internal Unix socket client mode and automatic terminal spawning. The MCP server handles JSON-RPC commands and replies via MCP-compliant notifications.
 
+### New Features in Version 1.1
+
+#### Exponential Backoff Restart
+When a VM disconnects, the bridge now uses exponential backoff to prevent reconnection storms:
+- Initial backoff: 1 second
+- Maximum backoff: 60 seconds
+- Per-VM state tracking: Each VM maintains its own backoff timer
+- Backoff resets on successful connection
+
+#### Non-Blocking Write System
+Version 1.1 introduces a truly non-blocking write system with three modes:
+- **Mode 0 (Pure Non-Blocking)**: Returns immediately if would block
+- **Mode 1 (Buffered)**: Queues data if can't write immediately
+- **Mode 2 (Legacy)**: Retry with timeout (default for backward compatibility)
+- Maximum write buffer: 1MB per destination
+- Automatic buffer flushing in the event loop
+
+#### Enhanced UTF-8 Handling
+- Binary data from VM is converted to UTF-8 safely
+- Non-printable characters are escaped for JSON transport
+- Preserves data integrity while ensuring JSON compatibility
+
 ### Internal Unix Socket Client Mode
 The script can be run in client mode to connect to an existing bridge:
 ```bash
-./serencp.pl --socket=/tmp/serial_${VM_NAME}.out
+./serencp.pl --socket /tmp/serial_${VM_NAME}.out
 ```
 
 This mode provides direct terminal access to the VM serial console through the Unix socket interface.
+
+### Explicit Terminal Selection
+You can explicitly specify which terminal to use:
+```bash
+./serencp.pl --terminal wezterm
+```
+
+This bypasses automatic detection and uses the specified terminal.
 
 ```mermaid
 graph TD
@@ -243,7 +335,7 @@ graph TD
     Client["MCP Client (LLM / Opencode)"]
     UnixIn["Unix Input Socket (/tmp/serial_VM_NAME.in)"]
     UnixOut["Unix Output Socket (/tmp/serial_VM_NAME.out)"]
-    ScriptClient["serencp.pl --socket=/tmp/serial_VM_NAME.out"]
+    ScriptClient["serencp.pl --socket /tmp/serial_VM_NAME.out"]
     ExtClients["External Clients (optional)"]
     LiveTerminal["Live Terminal View (Auto-Spawned)"]
 
@@ -315,14 +407,13 @@ TCP-->>VM: Command received on the serial console
 ### Terminal Access
 For direct interaction outside of the MCP environment, you can use the script itself as a client by specifying the output socket:
 ```bash
-./serencp.pl --socket=/tmp/serial_${VM_NAME}.out
+./serencp.pl --socket /tmp/serial_${VM_NAME}.out
 ```
 New output connections automatically receive the last 60 lines of history. Live output notifications are sent automatically when VM data is received, providing real-time streaming without polling. To send input, the client automatically opens and writes to the corresponding input socket (`/tmp/serial_${VM_NAME}.in`).
 
 ## Troubleshooting
-- **No terminal window is opened**: If the automatic terminal spawning fails, check the following environment variables are properly set:
-  First check if graphical apps can be launched from a root terminal (e.g : `pluma`)
-Then check correct values for these env vars :
+- **No terminal window is opened**: If the automatic terminal spawning fails, first check if graphical apps can be launched from a root terminal (e.g : `pluma`)
+Then check the following environment variables are properly set:
   - **XAUTHORITY**: Required for X11 authentication (e.g., `/root/.Xauthority`)
   - **XDG_RUNTIME_DIR**: Should be set to the user's runtime directory (e.g., `/run/user/0`)
   - **DBUS_SESSION_BUS_ADDRESS**: Required for D-Bus session communication
@@ -333,11 +424,43 @@ Then check correct values for these env vars :
   export XDG_RUNTIME_DIR=/run/user/0
   ```
 
+- **Terminal detection fails**: Use the `--terminal` option to explicitly specify your terminal emulator:
+  ```bash
+  ./serencp.pl --terminal wezterm
+  ```
+
 - **Failed to get tools**: Ensure the script is run in an environment where standard input/output is captured. Use `tools/list` to verify connectivity.
 - **Bridge not running**: Call `start` before attempting to read or write.
 - **No live notifications**: Ensure your MCP client supports notification handling. Notifications are sent automatically when VM output is received.
 - **Socket Permission**: Ensure `/tmp` is writable by the user running the MCP server.
 - **Syntax Check**: Run `perl -c serencp.pl` to verify script integrity.
+- **Write buffer full**: If you see "Write buffer full" warnings, the destination is not keeping up with data. This is normal during high-throughput scenarios and data will be dropped.
+- **Exponential backoff active**: If the bridge keeps restarting, you'll see increasing delays between reconnection attempts (1s, 2s, 4s... up to 60s). This is intentional to prevent connection storms.
+
+## Version History
+
+### Version 1.1 (2025-11-25)
+- Added exponential backoff for VM reconnection (prevents connection storms)
+- Added non-blocking write system with buffer queue
+- Added configurable log levels (debug, info, error)
+- Added MCP progress notifications support
+- Added `--terminal` option for explicit terminal selection
+- Enhanced terminal detection with test launch verification
+- Added tool annotations for better MCP client integration
+- Added robust END block cleanup
+- Added per-VM restart backoff state tracking
+- Enhanced UTF-8 handling with safe binary data conversion
+- Added socket file tracking for cleanup
+- Protocol version: 2025-11-25
+
+### Version 1.0.1 (2025-06-18)
+- Initial release with basic MCP server functionality
+- Persistent PTY with auto-restart
+- Ring buffer for output
+- Unix socket-based multi-client access
+- Automatic terminal spawning
+- Live output notifications
+- Protocol version: 2025-06-18
 
 ## About
 
@@ -347,4 +470,4 @@ The name `serencp` is a play on words:
 
 ## Feel free to contribute
 
-i still can't see output notifications on Opencode, the LLM still have to poll using the read tool to get output. Maybe Opencode does not support them correctly or maybe i'm doing something wrong. Since it's a really complex script, your help / pull requests are much appreciated !
+Since it's a complex script, your help / pull requests are much appreciated !

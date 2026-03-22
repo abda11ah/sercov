@@ -1,3 +1,5 @@
 mock_vm.pl
 *.json
 *test*
+*session*
+*opencode*
