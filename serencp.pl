@@ -209,24 +209,6 @@ my %TOOLS = (
 		},
 		handler => \&tool_write,
 	},
-	subscribe => {
-		description => "Subscribe to VM output notifications.",
-		inputSchema => {
-			type       => "object",
-			properties => { vm_name => { type => "string", description => "Name of the VM" } },
-			required   => ["vm_name"],
-		},
-		handler => \&tool_subscribe,
-	},
-	unsubscribe => {
-		description => "Unsubscribe from VM output notifications.",
-		inputSchema => {
-			type       => "object",
-			properties => { vm_name => { type => "string", description => "Name of the VM" } },
-			required   => ["vm_name"],
-		},
-		handler => \&tool_unsubscribe,
-	},
 );
 start_mcp_server() unless caller;
 END {

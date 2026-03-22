@@ -25,8 +25,8 @@ if ($options{'socket'}) {
 	run_unix_socket_client($socket_path);
 	exit 0;
 }
-our $VERSION               = "1.2 experimental";
-our $PROTOCOL_VERSION      = "2025-11-25";
+our $VERSION               = "1.4";
+our $PROTOCOL_VERSION      = "2025-06-18";
 our $DEFAULT_VM_PORT       = 4555;
 our $RING_BUFFER_SIZE      = 1000;
 our $MAX_BUFFER_BYTES      = 10 * 1024 * 1024;
