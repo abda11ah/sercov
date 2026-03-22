@@ -320,6 +320,17 @@ For direct interaction outside of the MCP environment, you can use the script it
 New output connections automatically receive the last 60 lines of history. Live output notifications are sent automatically when VM data is received, providing real-time streaming without polling. To send input, the client automatically opens and writes to the corresponding input socket (`/tmp/serial_${VM_NAME}.in`).
 
 ## Troubleshooting
+- **No terminal window is opened**: If the automatic terminal spawning fails, check the following environment variables are properly set:
+  - **XAUTHORITY**: Required for X11 authentication (e.g., `/root/.Xauthority`)
+  - **XDG_RUNTIME_DIR**: Should be set to the user's runtime directory (e.g., `/run/user/0`)
+  - **DBUS_SESSION_BUS_ADDRESS**: Required for D-Bus session communication
+
+  To fix these issues, run the script from a proper X11 session where these variables are automatically set, or export them manually:
+  ```bash
+  export XAUTHORITY=/root/.Xauthority
+  export XDG_RUNTIME_DIR=/run/user/0
+  ```
+
 - **Failed to get tools**: Ensure the script is run in an environment where standard input/output is captured. Use `tools/list` to verify connectivity.
 - **Bridge not running**: Call `start` before attempting to read or write.
 - **No live notifications**: Ensure your MCP client supports notification handling. Notifications are sent automatically when VM output is received.
