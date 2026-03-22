@@ -197,7 +197,7 @@ The server supports configurable log levels: `debug`, `info`, and `error`. By de
 
 All tools include enhanced MCP annotations for better UI integration (title, readOnlyHint, destructiveHint, idempotentHint, openWorldHint).
 
-The server provides 7 tools for VM serial console management:
+The server provides 8 tools for VM serial console management:
 
 ### 1. `start`
 Starts the bridge for a specific VM. If a bridge already exists, it is restarted to ensure a **clean slate** with fresh exponential backoff state.
@@ -243,6 +243,13 @@ Subscribe to live VM output notifications. Output is streamed via notifications/
 Unsubscribe from VM live output notifications.
 - **Arguments**: `{"vm_name": "string"}`
 - **Returns**: `{"success": true, "message": "Unsubscribed from VM output"}`
+- **Annotations**: Non-destructive, idempotent, open world
+
+### 8. `wait_for_output`
+Wait for new VM output to arrive. This tool blocks until new data is available from the VM serial console or the timeout is reached. It is useful for synchronous waiting when you need to wait for a command response before proceeding.
+- **Arguments**: `{"vm_name": "string", "timeout": "number"}` (timeout is optional, default: 10 seconds)
+- **Returns**: `{"success": true, "output": "...", "timed_out": false}` or `{"success": true, "output": "", "timed_out": true}`
+- **Example**: `tools/call {"name": "wait_for_output", "arguments": {"vm_name": "MYVM", "timeout": 5}}`
 - **Annotations**: Non-destructive, idempotent, open world
 
 ## Architecture

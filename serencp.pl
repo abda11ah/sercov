@@ -43,12 +43,12 @@ use constant {
 	MCP_INVALID_PARAMS        => -32602,
 	MCP_INTERNAL_ERROR        => -32603,
 	MCP_SERVER_ERROR          => -32000,
-};
+	};
 our %LOG_LEVEL_PRIORITY = (
 	debug => 0,
 	info  => 1,
 	error => 2,
-);
+	);
 our $current_log_level  = 'debug';
 our %bridges;
 our %restart_guard;
@@ -87,11 +87,11 @@ sub detect_terminal {
 			alarm(0);
 			return 1 if $exit == 0 || $exit == 1;
 			return 0;
-		};
+			};
 		alarm(0);
 		return 0 if $@;
 		return 1;
-	};
+		};
 	my @priority_terminals = (
 		{ name => 'Ghostty.app',      config => ['ghostty', '-e'],          check => sub { can_run('ghostty') && $test_launch->($_[0]) } },
 		{ name => 'WezTerm.app',      config => ['wezterm', 'start', '--'], check => sub { can_run('wezterm') && $test_launch->($_[0]) } },
@@ -109,7 +109,7 @@ sub detect_terminal {
 		{ name => 'xfce4-terminal',   config => ['xfce4-terminal', '-x'],   check => sub { can_run('xfce4-terminal') && $test_launch->($_[0]) } },
 		{ name => 'xterm',            config => ['xterm', '-e'],            check => sub { can_run('xterm') && $test_launch->($_[0]) } },
 		{ name => 'urxvt',            config => ['urxvt', '-e'],            check => sub { can_run('urxvt') && $test_launch->($_[0]) } },
-	);
+		);
 	if ($options{'terminal'}) {
 		my $user_terminal = $options{'terminal'};
 		my $cfg = [$user_terminal, '-e'];
@@ -135,7 +135,7 @@ sub detect_terminal {
 			'vscode-insiders' => ['code-insiders', '--wait'],
 			'Warp'            => ['warp'],
 			'Hyper'           => ['hyper'],
-		);
+			);
 		if (my $cfg = $map{$ENV{TERM_PROGRAM}}) {
 			my $bin = $cfg->[0];
 			if ($bin eq 'open' || $test_launch->($cfg)) {
@@ -165,38 +165,38 @@ my %TOOLS = (
 			properties => {
 				vm_name => { type => "string", description => "Name of the VM" },
 				port    => { type => "integer", description => "Port number for VM serial console (default: 4555)" },
-			},
+				},
 			required => ["vm_name"],
-		},
+			},
 		handler => \&tool_start,
-	},
+		},
 	stop => {
 		description => "Stop the bridge.",
 		inputSchema => {
 			type       => "object",
 			properties => { vm_name => { type => "string", description => "Name of the VM" } },
 			required   => ["vm_name"],
-		},
+			},
 		handler => \&tool_stop,
-	},
+		},
 	status => {
 		description => "Check the status of the bridge.",
 		inputSchema => {
 			type       => "object",
 			properties => { vm_name => { type => "string", description => "Name of the VM" } },
 			required   => ["vm_name"],
-		},
+			},
 		handler => \&tool_status,
-	},
+		},
 	read => {
 		description => "Read buffered output from VM serial console.",
 		inputSchema => {
 			type       => "object",
 			properties => { vm_name => { type => "string", description => "Name of the VM" } },
 			required   => ["vm_name"],
-		},
+			},
 		handler => \&tool_read,
-	},
+		},
 	write => {
 		description => "Send a command to the VM serial console.",
 		inputSchema => {
@@ -204,12 +204,24 @@ my %TOOLS = (
 			properties => {
 				vm_name => { type => "string", description => "Name of the VM" },
 				text    => { type => "string", description => "Command to send to the VM" },
-			},
+				},
 			required => ["vm_name", "text"],
-		},
+			},
 		handler => \&tool_write,
-	},
-);
+		},
+	wait_for_output => {
+		description => "Wait for new VM output (blocks until data available or timeout)",
+		inputSchema => {
+			type       => "object",
+			properties => {
+				vm_name => { type => "string", description => "Name of the VM" },
+				timeout => { type => "number", description => "Max seconds to wait (default: 10)" },
+				},
+			required => ["vm_name"],
+			},
+		handler => \&tool_wait_for_output,
+		}
+	);
 start_mcp_server() unless caller;
 END {
 	return unless $IS_PARENT;
@@ -248,49 +260,46 @@ sub send_progress_notification {
 		progressToken => $progressToken,
 		progress      => $progress,
 		total         => $total,
-	};
+		};
 	$params->{message} = $message if defined $message;
 	emit_json_line({
-		jsonrpc => "2.0",
-		method  => "notifications/progress",
-		params  => $params,
-	});
+			jsonrpc => "2.0",
+			method  => "notifications/progress",
+			params  => $params,
+		});
 }
 sub send_resource_updated_notification {
 	my ($uri) = @_;
 	return unless $$ == $PARENT_PID;
 	return unless $resource_subscriptions{$uri};
 	emit_json_line({
-		jsonrpc => "2.0",
-		method  => "notifications/resources/updated",
-		params  => {
-			uri => $uri,
-		},
-	});
+			jsonrpc => "2.0",
+			method  => "notifications/resources/updated",
+			params  => {
+				uri => $uri,
+				},
+		});
 }
 sub send_resource_list_changed_notification {
 	return unless $$ == $PARENT_PID;
 	emit_json_line({
-		jsonrpc => "2.0",
-		method  => "notifications/resources/list_changed",
-	});
+			jsonrpc => "2.0",
+			method  => "notifications/resources/list_changed",
+		});
 }
 sub buffer_vm_output {
 	my ($vm_name, $chunk) = @_;
 	my $bridge = $bridges{$vm_name};
 	return unless $bridge;
-
 	push @{ $bridge->{buffer} }, \$chunk;
 	$bridge->{buffer_bytes} += length($chunk);
 	$bridge->{total_bytes_received} += length($chunk);
-
 	# Trim buffer if needed
 	while (@{ $bridge->{buffer} } > $RING_BUFFER_SIZE ||
-	       $bridge->{buffer_bytes} > $MAX_BUFFER_BYTES) {
+		$bridge->{buffer_bytes} > $MAX_BUFFER_BYTES) {
 		my $removed_ref = shift @{ $bridge->{buffer} };
 		$bridge->{buffer_bytes} -= length($$removed_ref) if defined $removed_ref;
 	}
-
 	# Notify subscribed clients that the resource has been updated
 	my $uri = "vm://$vm_name/output";
 	send_resource_updated_notification($uri);
@@ -303,8 +312,8 @@ sub mcp_error {
 		error   => {
 			code    => $code,
 			message => $message,
-		},
-	};
+			},
+		};
 	$error_response->{error}{data} = $data if defined $data;
 	return encode_json($error_response);
 }
@@ -313,7 +322,7 @@ sub tool_exec_error {
 	return {
 		content => [{ type => "text", text => $message }],
 		isError => JSON::PP::true,
-	};
+		};
 }
 sub write_all_nonblocking {
 	my ($fh, $data, $timeout, $mode) = @_;
@@ -390,7 +399,7 @@ sub _queue_write_buffer {
 			buffer       => [],
 			buffer_bytes => 0,
 			fileno       => $fd,
-		};
+			};
 	}
 	push @{ $write_buffers{$fd}{buffer} }, $data;
 	$write_buffers{$fd}{buffer_bytes} += length($data);
@@ -446,7 +455,7 @@ sub start_mcp_server {
 	local $SIG{PIPE} = 'IGNORE';
 	local $SIG{CHLD} = sub {
 		while (waitpid(-1, WNOHANG) > 0) { }
-	};
+		};
 	binmode(STDIN,  ':raw');
 	binmode(STDOUT, ':raw');
 	local $| = 1;
@@ -499,33 +508,33 @@ sub start_mcp_server {
 					my $decoded = decode_utf8($raw_line, FB_CROAK);
 					$request = decode_json($decoded);
 					1;
-				} or do {
+					} or do {
 					my $err = $@ || "unknown parse error";
 					debug("Parse error: $err");
 					emit_json_line({
-						jsonrpc => "2.0",
-						id      => undef,
-						error   => {
-							code    => MCP_PARSE_ERROR,
-							message => "Parse error",
-							data    => "$err",
-						},
-					});
+							jsonrpc => "2.0",
+							id      => undef,
+							error   => {
+								code    => MCP_PARSE_ERROR,
+								message => "Parse error",
+								data    => "$err",
+								},
+						});
 					next;
-				};
+					};
 				my $response = eval { handle_request($request) };
 				if (my $err = $@) {
 					debug("Request handler error: $err");
 					if (ref($request) eq 'HASH' && exists $request->{id}) {
 						emit_json_line({
-							jsonrpc => "2.0",
-							id      => $request->{id},
-							error   => {
-								code    => MCP_INTERNAL_ERROR,
-								message => "Internal error",
-								data    => "$err",
-							},
-						});
+								jsonrpc => "2.0",
+								id      => $request->{id},
+								error   => {
+									code    => MCP_INTERNAL_ERROR,
+									message => "Internal error",
+									data    => "$err",
+									},
+							});
 					}
 					next;
 				}
@@ -559,8 +568,8 @@ sub handle_request {
 				code    => MCP_INVALID_REQUEST,
 				message => "Invalid Request",
 				data    => "Request must be a JSON object",
-			},
-		};
+				},
+			};
 	}
 	my $jsonrpc = $request->{jsonrpc};
 	my $method  = $request->{method};
@@ -576,8 +585,8 @@ sub handle_request {
 				code    => MCP_INVALID_REQUEST,
 				message => "Invalid Request",
 				data    => "jsonrpc must be '2.0'",
-			},
-		};
+				},
+			};
 	}
 	if (!defined $method || ref($method) || $method eq '') {
 		return if $is_notification;
@@ -588,8 +597,8 @@ sub handle_request {
 				code    => MCP_INVALID_REQUEST,
 				message => "Invalid Request",
 				data    => "method must be a non-empty string",
-			},
-		};
+				},
+			};
 	}
 	if (ref($params) && ref($params) ne 'HASH' && ref($params) ne 'ARRAY') {
 		return if $is_notification;
@@ -599,8 +608,8 @@ sub handle_request {
 			error   => {
 				code    => MCP_INVALID_PARAMS,
 				message => "Invalid params",
-			},
-		};
+				},
+			};
 	}
 	# --- initialize ---
 	if ($method eq 'initialize') {
@@ -614,14 +623,14 @@ sub handle_request {
 					logging   => {},
 					resources => { subscribe => JSON::PP::true, listChanged => JSON::PP::true },
 					tools     => { listChanged => JSON::PP::true },
-				},
+					},
 				serverInfo => {
 					name        => "serencp",
 					version     => $VERSION,
 					description => "MCP server for VM serial console communication via TCP/Unix sockets.",
+					},
 				},
-			},
-		};
+			};
 	}
 	# --- notifications/initialized (client notification, no response) ---
 	if ($method eq 'notifications/initialized') {
@@ -649,8 +658,8 @@ sub handle_request {
 			error   => {
 				code    => MCP_INVALID_PARAMS,
 				message => "Invalid log level: " . ($level // 'undef') . ". Valid: " . join(', ', sort keys %LOG_LEVEL_PRIORITY),
-			},
-		};
+				},
+			};
 	}
 	# --- resources/list ---
 	if ($method eq 'resources/list') {
@@ -662,7 +671,7 @@ sub handle_request {
 				name        => "VM Output: $vm_name",
 				description => "Buffered serial console output for $vm_name",
 				mimeType    => "text/plain",
-			};
+				};
 		}
 		return { jsonrpc => "2.0", id => $id, result => { resources => \@resources } };
 	}
@@ -683,26 +692,26 @@ sub handle_request {
 					eval { $text = decode_utf8($raw_bytes, 1); 1 } or do {
 						$text = $raw_bytes;
 						$text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge;
-					};
+						};
 				}
 				return {
 					jsonrpc => "2.0",
 					id      => $id,
 					result  => {
 						contents => [{
-							uri      => $uri,
-							mimeType => "text/plain",
-							text     => $text,
-						}],
-					},
-				};
+								uri      => $uri,
+								mimeType => "text/plain",
+								text     => $text,
+							}],
+						},
+					};
 			}
 		}
 		return {
 			jsonrpc => "2.0",
 			id      => $id,
 			error   => { code => MCP_INVALID_REQUEST, message => "Resource not found or bridge not running" },
-		};
+			};
 	}
 	# --- resources/subscribe ---
 	if ($method eq 'resources/subscribe') {
@@ -716,7 +725,7 @@ sub handle_request {
 				jsonrpc => "2.0",
 				id      => $id,
 				error   => { code => MCP_INVALID_PARAMS, message => "Invalid resource URI" },
-			};
+				};
 		}
 		$resource_subscriptions{$uri} = 1;
 		debug("Resource subscription added: $uri");
@@ -734,7 +743,7 @@ sub handle_request {
 				jsonrpc => "2.0",
 				id      => $id,
 				error   => { code => MCP_INVALID_PARAMS, message => "Invalid resource URI" },
-			};
+				};
 		}
 		delete $resource_subscriptions{$uri};
 		debug("Resource subscription removed: $uri");
@@ -749,7 +758,7 @@ sub handle_request {
 				name        => $name,
 				description => $TOOLS{$name}{description},
 				inputSchema => $TOOLS{$name}{inputSchema},
-			);
+				);
 			$tool_def{annotations} = $TOOLS{$name}{annotations} if $TOOLS{$name}{annotations};
 			push @list, \%tool_def;
 		}
@@ -766,8 +775,8 @@ sub handle_request {
 					code    => MCP_INVALID_PARAMS,
 					message => "Invalid params",
 					data    => "tools/call params must be an object",
-				},
-			};
+					},
+				};
 		}
 		my $name = $params->{name};
 		my $args = $params->{arguments} || {};
@@ -781,8 +790,8 @@ sub handle_request {
 					code    => MCP_INVALID_PARAMS,
 					message => "Invalid params",
 					data    => "Tool name must be a non-empty string",
-				},
-			};
+					},
+				};
 		}
 		if (my $tool = $TOOLS{$name}) {
 			my $res = $tool->{handler}->($args);
@@ -796,21 +805,21 @@ sub handle_request {
 				result  => {
 					content => [{ type => "text", text => $json_text }],
 					isError => JSON::PP::false,
-				},
-			};
+					},
+				};
 		}
 		return {
 			jsonrpc => "2.0",
 			id      => $id,
 			error   => { code => MCP_METHOD_NOT_FOUND, message => "Tool not found: $name" },
-		};
+			};
 	}
 	return if $is_notification;
 	return {
 		jsonrpc => "2.0",
 		id      => $id,
 		error   => { code => MCP_METHOD_NOT_FOUND, message => "Method not found: $method" },
-	};
+		};
 }
 sub tool_start {
 	my ($params) = @_;
@@ -862,7 +871,7 @@ sub tool_status {
 			buffer_size  => scalar(@{ $bridge->{buffer} }),
 			buffer_bytes => $bridge->{buffer_bytes} || 0,
 			subscribed   => $resource_subscriptions{$uri} ? JSON::PP::true : JSON::PP::false,
-		};
+			};
 	}
 	return {
 		running      => JSON::PP::false,
@@ -871,7 +880,7 @@ sub tool_status {
 		buffer_size  => 0,
 		buffer_bytes => 0,
 		subscribed   => JSON::PP::false,
-	};
+		};
 }
 sub tool_read {
 	my ($params) = @_;
@@ -891,13 +900,93 @@ sub tool_read {
 		eval { $text = decode_utf8($raw_bytes, 1); 1 } or do {
 			$text = $raw_bytes;
 			$text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge;
-		};
+			};
 	}
 	# Clear buffer after read (destructive read)
 	@{ $bridge->{buffer} } = ();
 	$bridge->{buffer_bytes} = 0;
 	debug("Read completed: $total_bytes bytes from VM output");
 	return { success => JSON::PP::true, output => $text };
+}
+sub tool_wait_for_output {
+	my ($params) = @_;
+	$params = {} unless ref($params) eq 'HASH';
+	$params = { map { lc($_) => $params->{$_} } keys %$params };
+	my $vm_name = $params->{vm_name};
+	my $timeout = $params->{timeout} // 10;
+	$timeout = 30 if $timeout > 30;  # cap at 30s
+	return tool_exec_error("vm_name parameter is required")
+		unless defined $vm_name && length $vm_name;
+	return tool_exec_error("Bridge not running for VM: $vm_name")
+		unless bridge_exists($vm_name);
+	my $bridge = $bridges{$vm_name};
+	my $initial_count = $bridge->{total_bytes_received} // 0;
+	my $progressToken;
+	$progressToken = $params->{_meta}{progressToken}
+		if ref($params->{_meta}) eq 'HASH';
+	my $start = time();
+	my $last_progress = 0;
+	while (time() - $start < $timeout) {
+		# Process bridge IO while waiting
+		if ($bridge->{select}) {
+			my @ready = $bridge->{select}->can_read(0.1);
+			for my $fh (@ready) {
+				monitor_bridge($vm_name, $fh);
+			}
+		}
+		# Check if new data arrived
+		$bridge = $bridges{$vm_name};
+		last unless $bridge;  # bridge was stopped
+		my $current_count = $bridge->{total_bytes_received} // 0;
+		if ($current_count > $initial_count) {
+			# New data available, return it
+			my $text = "";
+			if (@{ $bridge->{buffer} }) {
+				my $raw_bytes = join('', map { $$_ } @{ $bridge->{buffer} });
+				eval { $text = decode_utf8($raw_bytes, 1); 1 } or do {
+					$text = $raw_bytes;
+					$text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge;
+					};
+			}
+			# Clear buffer
+			@{ $bridge->{buffer} } = ();
+			$bridge->{buffer_bytes} = 0;
+			return {
+				success    => JSON::PP::true,
+				output     => $text,
+				bytes_new  => $current_count - $initial_count,
+				waited     => sprintf("%.1f", time() - $start),
+				};
+		}
+		# Send progress if token available
+		if ($progressToken && time() - $last_progress >= 2) {
+			my $elapsed = int(time() - $start);
+			send_progress_notification(
+				$progressToken, $elapsed, $timeout,
+				"Waiting for VM output..."
+				);
+			$last_progress = time();
+		}
+		flush_write_buffers() if %write_buffers;
+	}
+	# Timeout — return whatever is buffered
+	my $text = "";
+	$bridge = $bridges{$vm_name};
+	if ($bridge && @{ $bridge->{buffer} }) {
+		my $raw_bytes = join('', map { $$_ } @{ $bridge->{buffer} });
+		eval { $text = decode_utf8($raw_bytes, 1); 1 } or do {
+			$text = $raw_bytes;
+			$text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge;
+			};
+		@{ $bridge->{buffer} } = ();
+		$bridge->{buffer_bytes} = 0;
+	}
+	return {
+		success  => JSON::PP::true,
+		output   => $text,
+		timeout  => JSON::PP::true,
+		waited   => sprintf("%.1f", time() - $start),
+		};
 }
 sub tool_write {
 	my ($params) = @_;
@@ -922,7 +1011,7 @@ sub tool_write {
 	return {
 		success => $ok ? JSON::PP::true : JSON::PP::false,
 		message => $ok ? "Command sent successfully" : "Failed to send command",
-	};
+		};
 }
 sub bridge_exists {
 	my ($vm_name) = @_;
@@ -1010,19 +1099,15 @@ sub start_bridge {
 	if ($pid == 0) {
 		$IS_PARENT = 0;
 		close($read_pipe);
-
 		# Close master-side references to sockets (child doesn't need them)
 		$socket_in->close();
 		$socket_out->close();
-
 		# Open slave PTYs properly in child context
 		my $pty_in_slave  = $pty_in->slave();
 		my $pty_out_slave = $pty_out->slave();
-
 		# Close master sides in child
 		$pty_in->close();
 		$pty_out->close();
-
 		# Configure slave terminals
 		my $termios = POSIX::Termios->new();
 		for my $slave ($pty_in_slave, $pty_out_slave) {
@@ -1034,7 +1119,6 @@ sub start_bridge {
 			$termios->setlflag($lflag);
 			$termios->setattr($fd, TCSANOW);
 		}
-
 		debug("Child process: Connecting to VM serial console on port $port");
 		my $vm_socket;
 		my $retry_count = 0;
@@ -1045,7 +1129,7 @@ sub start_bridge {
 				PeerPort => $port,
 				Proto    => 'tcp',
 				Timeout  => 2,
-			);
+				);
 			unless ($vm_socket) {
 				$retry_count++;
 				debug("Child: Connection attempt $retry_count failed, retrying...");
@@ -1115,7 +1199,7 @@ sub start_bridge {
 			restarting           => 0,
 			session              => { id => $session_id, clients => {}, input_clients => {} },
 			select               => IO::Select->new($pty_out, $socket_in, $socket_out),
-		};
+			};
 		set_nonblocking($pty_in);
 		set_nonblocking($pty_out);
 		my $term_pid = $old_term_pid;
@@ -1125,11 +1209,9 @@ sub start_bridge {
 			$term_pid = spawn_terminal_client($vm_name, $socket_in_path, $socket_out_path);
 			$bridges{$vm_name}{terminal_pid} = $term_pid if exists $bridges{$vm_name};
 		}
-
 		# Notify that resource list changed (new VM resource available)
 		send_resource_list_changed_notification();
 		send_progress_notification($progressToken, 5, 5, "Bridge ready") if $progressToken;
-
 		return {
 			success      => JSON::PP::true,
 			message      => "Bridge started for VM: $vm_name",
@@ -1138,7 +1220,7 @@ sub start_bridge {
 			socket_out   => $socket_out_path,
 			session_id   => $session_id,
 			terminal_pid => $term_pid,
-		};
+			};
 	}
 	debug("Bridge setup failed — cleaning up");
 	terminate_process($pid, "bridge child for VM $vm_name") if $pid;
@@ -1219,7 +1301,7 @@ sub bridge_process_child {
 			last;
 		}
 	}
-CHILD_EXIT:
+	CHILD_EXIT:
 	debug("Bridge child: Closing connections");
 	close $vm_socket;
 	close $pty_in_slave;
@@ -1441,7 +1523,7 @@ sub cleanup {
 			last unless -e $path || -S $path;
 			sleep(0.1);
 		}
-	};
+		};
 	for my $socket_path (@created_socket_files) {
 		next unless defined $socket_path && length $socket_path;
 		debug("Cleaning up tracked socket file: $socket_path");
@@ -1458,13 +1540,13 @@ sub cleanup {
 				Type    => SOCK_STREAM,
 				Peer    => $path,
 				Timeout => 0.1,
-			);
+				);
 			if ($test_sock) {
 				$test_sock->close();
 				$is_alive = 1;
 			}
 			1;
-		};
+			};
 		next if $is_alive;
 		debug("Removing probable orphaned socket file: $path");
 		$remove_with_retry->($path);
@@ -1482,7 +1564,7 @@ sub spawn_terminal_client {
 		my @fallbacks = (
 			['xterm', '-e'],
 			['sh', '-c'],
-		);
+			);
 		for my $cfg (@fallbacks) {
 			if (can_run($cfg->[0])) {
 				$terminal_config = $cfg;
