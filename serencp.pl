@@ -1325,21 +1325,14 @@ sub monitor_bridge {
 				my $removed_ref = shift @{ $bridge->{buffer} };
 				$bridge->{buffer_bytes} -= length($$removed_ref) if defined $removed_ref;
 			}
-			# Enhanced resource updated notification
+			# Resource updated notification (compliant with MCP 1.0)
 			my $uri = "vm://$vm_name/output";
 			if ($resource_subscriptions{$uri}) {
-				my $safe_text;
-				eval { $safe_text = decode_utf8($buffer, 1); 1 } or do {
-					$safe_text = $buffer;
-					$safe_text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge;
-				};
 				emit_json_line({
 					jsonrpc => "2.0",
 					method  => "notifications/resources/updated",
 					params  => {
-						uri     => $uri,
-						content => $safe_text,
-						stream  => "stdout",
+						uri => $uri,
 					},
 				});
 			}
