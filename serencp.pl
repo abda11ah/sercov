@@ -36,6 +36,8 @@ our $SIGKILL_WAIT    = 1;
 our $RESTART_BACKOFF_INITIAL = 1.0;
 our $RESTART_BACKOFF_MAX     = 60;
 our %restart_backoff;
+our $CONSOLE_KILL_TIMEOUT    = 60;
+our $last_progress_time      = 0;
 use constant {
 	MCP_PARSE_ERROR           => -32700,
 	MCP_INVALID_REQUEST       => -32600,
@@ -246,26 +248,14 @@ sub send_progress_notification {
 	return unless $$ == $PARENT_PID;
 	my $params = {
 		progressToken => $progressToken,
-		progress      => $progress,
-		total         => $total,
 		};
+	$params->{progress} = $progress if defined $progress;
+	$params->{total}    = $total    if defined $total;
 	$params->{message} = $message if defined $message;
 	emit_json_line({
 			jsonrpc => "2.0",
 			method  => "notifications/progress",
 			params  => $params,
-		});
-}
-sub send_resource_updated_notification {
-	my ($uri) = @_;
-	return unless $$ == $PARENT_PID;
-	return unless $resource_subscriptions{$uri};
-	emit_json_line({
-			jsonrpc => "2.0",
-			method  => "notifications/resources/updated",
-			params  => {
-				uri => $uri,
-				},
 		});
 }
 sub send_resource_list_changed_notification {
@@ -274,23 +264,6 @@ sub send_resource_list_changed_notification {
 			jsonrpc => "2.0",
 			method  => "notifications/resources/list_changed",
 		});
-}
-sub buffer_vm_output {
-	my ($vm_name, $chunk) = @_;
-	my $bridge = $bridges{$vm_name};
-	return unless $bridge;
-	push @{ $bridge->{buffer} }, \$chunk;
-	$bridge->{buffer_bytes} += length($chunk);
-	$bridge->{total_bytes_received} += length($chunk);
-	# Trim buffer if needed
-	while (@{ $bridge->{buffer} } > $RING_BUFFER_SIZE ||
-		$bridge->{buffer_bytes} > $MAX_BUFFER_BYTES) {
-		my $removed_ref = shift @{ $bridge->{buffer} };
-		$bridge->{buffer_bytes} -= length($$removed_ref) if defined $removed_ref;
-	}
-	# Notify subscribed clients that the resource has been updated
-	my $uri = "vm://$vm_name/output";
-	send_resource_updated_notification($uri);
 }
 sub mcp_error {
 	my ($id, $code, $message, $data) = @_;
@@ -535,6 +508,22 @@ sub start_mcp_server {
 			my @bridge_ready = $bridge->{select}->can_read(0.01);
 			for my $fh (@bridge_ready) {
 				monitor_bridge($vm_name, $fh);
+			}
+		}
+		# Periodic progress notifications for unread VM content (every 0.5s)
+		if (time() - $last_progress_time >= 0.5) {
+			$last_progress_time = time();
+			foreach my $vm_name (keys %bridges) {
+				my $bridge = $bridges{$vm_name};
+				if ($bridge && @{ $bridge->{buffer} } && $bridge->{last_progress_token}) {
+					my $raw_bytes = join('', map { $$_ } @{ $bridge->{buffer} });
+					my $text;
+					eval { $text = decode_utf8($raw_bytes, 1); 1 } or do {
+						$text = $raw_bytes;
+						$text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge;
+					};
+					send_progress_notification($bridge->{last_progress_token}, undef, undef, $text);
+				}
 			}
 		}
 		flush_write_buffers() if %write_buffers;
@@ -966,8 +955,9 @@ sub start_bridge {
 		return tool_exec_error("Failed to create communication pipe for VM: $vm_name: $!");
 	}
 	send_progress_notification($progressToken, 1, 5, "Creating Unix sockets") if $progressToken;
-	my $socket_in_path  = "/tmp/serial_${vm_name}.in";
-	my $socket_out_path = "/tmp/serial_${vm_name}.out";
+	my $session_id = sprintf("%s_%d", $vm_name, time());
+	my $socket_in_path  = "/tmp/serial_${session_id}.in";
+	my $socket_out_path = "/tmp/serial_${session_id}.out";
 	remove_socket_file($socket_in_path,  "bridge setup");
 	remove_socket_file($socket_out_path, "bridge setup");
 	my $socket_in  = IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => $socket_in_path, Listen => 8);
@@ -1091,7 +1081,6 @@ sub start_bridge {
 	close($read_pipe);
 	if ($ready) {
 		send_progress_notification($progressToken, 4, 5, "Setting up terminal") if $progressToken;
-		my $session_id = sprintf("session_%s_%d", $vm_name, time());
 		push @created_socket_files, ($socket_in_path, $socket_out_path);
 		$bridges{$vm_name} = {
 			pty_in               => $pty_in,
@@ -1105,6 +1094,10 @@ sub start_bridge {
 			pid                  => $pid,
 			terminal_pid         => $old_term_pid,
 			restarting           => 0,
+			last_progress_token  => $progressToken,
+			socket_in_path       => $socket_in_path,
+			socket_out_path      => $socket_out_path,
+			session_id           => $session_id,
 			session              => { id => $session_id, clients => {}, input_clients => {} },
 			select               => IO::Select->new($pty_out, $socket_in, $socket_out),
 			};
@@ -1270,8 +1263,17 @@ sub stop_bridge {
 	$bridge->{pty_out}->close()    if $bridge->{pty_out};
 	$bridge->{socket_in}->close()  if $bridge->{socket_in};
 	$bridge->{socket_out}->close() if $bridge->{socket_out};
-	remove_socket_file("/tmp/serial_${vm_name}.in",  "bridge cleanup");
-	remove_socket_file("/tmp/serial_${vm_name}.out", "bridge cleanup");
+
+	my $s_in = $bridge->{socket_in_path};
+	my $s_out = $bridge->{socket_out_path};
+	remove_socket_file($s_in, "bridge cleanup ($vm_name)") if $s_in;
+	remove_socket_file($s_out, "bridge cleanup ($vm_name)") if $s_out;
+
+	# Also cleanup by pattern as safety
+	my @socks = glob("/tmp/serial_${vm_name}_*.in /tmp/serial_${vm_name}_*.out");
+	for my $s (@socks) {
+		remove_socket_file($s, "bridge cleanup safety ($vm_name)");
+	}
 	delete $bridges{$vm_name};
 	delete $restart_guard{$vm_name};
 	delete $restart_backoff{$vm_name};
@@ -1313,8 +1315,34 @@ sub monitor_bridge {
 		my $bytes = sysread($bridge->{pty_out}, $buffer, 4096);
 		if (defined $bytes && $bytes > 0) {
 			debug("Monitor: Read $bytes bytes from VM via output PTY");
-			# Buffer the output and send resource updated notification
-			buffer_vm_output($vm_name, $buffer);
+			# Buffer the output
+			push @{ $bridge->{buffer} }, \$buffer;
+			$bridge->{buffer_bytes} += length($buffer);
+			$bridge->{total_bytes_received} += length($buffer);
+			# Trim buffer if needed
+			while (@{ $bridge->{buffer} } > $RING_BUFFER_SIZE ||
+				$bridge->{buffer_bytes} > $MAX_BUFFER_BYTES) {
+				my $removed_ref = shift @{ $bridge->{buffer} };
+				$bridge->{buffer_bytes} -= length($$removed_ref) if defined $removed_ref;
+			}
+			# Enhanced resource updated notification
+			my $uri = "vm://$vm_name/output";
+			if ($resource_subscriptions{$uri}) {
+				my $safe_text;
+				eval { $safe_text = decode_utf8($buffer, 1); 1 } or do {
+					$safe_text = $buffer;
+					$safe_text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge;
+				};
+				emit_json_line({
+					jsonrpc => "2.0",
+					method  => "notifications/resources/updated",
+					params  => {
+						uri     => $uri,
+						content => $safe_text,
+						stream  => "stdout",
+					},
+				});
+			}
 			# Forward to all connected terminal socket clients
 			for my $cid (keys %{ $bridge->{session}{clients} }) {
 				my $client = $bridge->{session}{clients}{$cid};
@@ -1541,18 +1569,28 @@ sub run_unix_socket_client {
 	my $base_delay  = 0.5;
 	my $max_delay   = 16;
 	my $retry_count = 0;
+	my $first_fail_time = 0;
 	while (1) {
 		my $delay = $base_delay * (2 ** $retry_count);
 		$delay = $max_delay if $delay > $max_delay;
 		my $sock_in  = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $socket_in_path);
 		my $sock_out = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $socket_out_path);
 		unless (defined $sock_in && defined $sock_out) {
-			print STDERR "Cannot connect to sockets (attempt $retry_count). Retrying in ${delay}s...\n";
+			if ($first_fail_time == 0) {
+				$first_fail_time = time();
+			}
+			my $elapsed = time() - $first_fail_time;
+			if ($CONSOLE_KILL_TIMEOUT > 0 && $elapsed >= $CONSOLE_KILL_TIMEOUT) {
+				print STDERR "Cannot connect to bridge after ${elapsed}s. Closing terminal.\n";
+				exit(0);
+			}
+			print STDERR "Cannot connect to sockets (attempt $retry_count, ${elapsed}s/${CONSOLE_KILL_TIMEOUT}s). Retrying in ${delay}s...\n";
 			$retry_count++;
 			sleep $delay;
 			next;
 		}
 		$retry_count = 0;
+		$first_fail_time = 0;
 		binmode(STDOUT, ':raw');
 		set_nonblocking(\*STDIN);
 		set_nonblocking($sock_out);
