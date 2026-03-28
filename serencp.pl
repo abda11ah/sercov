@@ -101,6 +101,7 @@ sub detect_terminal {
 		{ name => 'kitty',            config => ['kitty', '--'],            check => sub { can_run('kitty') && $test_launch->($_[0]) } },
 		{ name => 'alacritty',        config => ['alacritty', '-e'],        check => sub { can_run('alacritty') && $test_launch->($_[0]) } },
 		{ name => 'ghostty',          config => ['ghostty', '-e'],          check => sub { can_run('ghostty') && $test_launch->($_[0]) } },
+		{ name => 'ptyxis',           config => ['ptyxis', '--'],           check => sub { can_run('ptyxis') && $test_launch->($_[0]) } },
 		{ name => 'foot',             config => ['foot'],                   check => sub { can_run('foot') && $test_launch->($_[0]) } },
 		{ name => 'konsole',          config => ['konsole', '-e'],          check => sub { can_run('konsole') && $test_launch->($_[0]) } },
 		{ name => 'gnome-terminal',   config => ['gnome-terminal', '--'],   check => sub { can_run('gnome-terminal') && $test_launch->($_[0]) } },
@@ -121,6 +122,8 @@ sub detect_terminal {
 			$cfg = [$user_terminal, '--'];
 		} elsif ($user_terminal eq 'kitty') {
 			$cfg = [$user_terminal];
+		} elsif ($user_terminal eq 'ptyxis') {
+			$cfg = [$user_terminal, '--'];
 		}
 		if (can_run($user_terminal) && $test_launch->($cfg)) {
 			return $cfg;
@@ -1509,6 +1512,10 @@ sub spawn_terminal_client {
 		}
 		if ($bin eq 'kitty' && !@prefix) {
 			exec($bin, @client_cmd);
+			exit(1);
+		}
+		if ($bin eq 'ptyxis') {
+			exec($bin, @prefix, @client_cmd);
 			exit(1);
 		}
 		exec($bin, @prefix, @client_cmd);
