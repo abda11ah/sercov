@@ -25,7 +25,7 @@ if ($options{'socket'}) {
 	run_unix_socket_client($socket_path);
 	exit 0;
 }
-our $VERSION               = "1.1";
+our $VERSION               = "1.2";
 our $PROTOCOL_VERSION      = "2025-06-18";
 our $DEFAULT_VM_PORT       = 4555;
 our $RING_BUFFER_SIZE      = 1000;
@@ -36,6 +36,7 @@ our $SIGKILL_WAIT    = 1;
 our $RESTART_BACKOFF_INITIAL = 1.0;
 our $RESTART_BACKOFF_MAX     = 60;
 our %restart_backoff;
+our $CONSOLE_KILL_TIMEOUT    = 60;
 use constant {
 	MCP_PARSE_ERROR           => -32700,
 	MCP_INVALID_REQUEST       => -32600,
@@ -58,8 +59,9 @@ our $IS_PARENT          = 1;
 our @created_socket_files = ();
 our %write_buffers;
 our $MAX_WRITE_BUFFER_BYTES = 1024 * 1024;
-# Track resource subscriptions separately from tool-level subscriptions
-our %resource_subscriptions;  # uri => 1
+# Track resource subscriptions separately from progress subscriptions
+our %resource_subscriptions;     # uri => 1
+our %progress_subscriptions;     # progressToken => { vm_name => $vm_name, last_sent => $time }
 if ($^O !~ /^(linux|darwin|freebsd|openbsd|netbsd|solaris|aix|cygwin|dragonfly|midnightbsd|gnu|haiku|hpux|irix|minix|qnx|sco|sysv|unix)/i) {
 	print encode_utf8(mcp_error(undef, MCP_SERVER_ERROR, "Unsupported Operating System: $^O. This server only runs on *nix-like systems.")) . "\n";
 	exit 1;
@@ -246,26 +248,14 @@ sub send_progress_notification {
 	return unless $$ == $PARENT_PID;
 	my $params = {
 		progressToken => $progressToken,
-		progress      => $progress,
-		total         => $total,
 		};
+	$params->{progress} = $progress if defined $progress;
+	$params->{total}    = $total    if defined $total;
 	$params->{message} = $message if defined $message;
 	emit_json_line({
 			jsonrpc => "2.0",
 			method  => "notifications/progress",
 			params  => $params,
-		});
-}
-sub send_resource_updated_notification {
-	my ($uri) = @_;
-	return unless $$ == $PARENT_PID;
-	return unless $resource_subscriptions{$uri};
-	emit_json_line({
-			jsonrpc => "2.0",
-			method  => "notifications/resources/updated",
-			params  => {
-				uri => $uri,
-				},
 		});
 }
 sub send_resource_list_changed_notification {
@@ -275,22 +265,15 @@ sub send_resource_list_changed_notification {
 			method  => "notifications/resources/list_changed",
 		});
 }
-sub buffer_vm_output {
-	my ($vm_name, $chunk) = @_;
-	my $bridge = $bridges{$vm_name};
-	return unless $bridge;
-	push @{ $bridge->{buffer} }, \$chunk;
-	$bridge->{buffer_bytes} += length($chunk);
-	$bridge->{total_bytes_received} += length($chunk);
-	# Trim buffer if needed
-	while (@{ $bridge->{buffer} } > $RING_BUFFER_SIZE ||
-		$bridge->{buffer_bytes} > $MAX_BUFFER_BYTES) {
-		my $removed_ref = shift @{ $bridge->{buffer} };
-		$bridge->{buffer_bytes} -= length($$removed_ref) if defined $removed_ref;
-	}
-	# Notify subscribed clients that the resource has been updated
-	my $uri = "vm://$vm_name/output";
-	send_resource_updated_notification($uri);
+sub send_resource_updated_notification {
+	my ($uri) = @_;
+	return unless $$ == $PARENT_PID;
+	return unless $resource_subscriptions{$uri};
+	emit_json_line({
+			jsonrpc => "2.0",
+			method  => "notifications/resources/updated",
+			params  => { uri => $uri },
+		});
 }
 sub mcp_error {
 	my ($id, $code, $message, $data) = @_;
@@ -455,12 +438,14 @@ sub start_mcp_server {
 	set_nonblocking(\*STDOUT) or print STDERR "Warning: Can't set STDOUT nonblocking: $!\n";
 	printf STDERR "[DEBUG $$] Starting $0 MCP Server (protocol $PROTOCOL_VERSION)...\n" if should_log('debug');
 	my $stdin_buffer = '';
+	my $last_progress_time = 0;
 	while ($running) {
 		if ($mcp_select->count == 0 && !%bridges) {
 			printf STDERR "[DEBUG $$] No more inputs or active bridges. Shutting down...\n" if should_log('debug');
 			$running = 0;
 			last;
 		}
+		# Handle MCP messages
 		my @mcp_ready = $mcp_select->can_read(0.01);
 		for my $fh (@mcp_ready) {
 			next unless $fh == \*STDIN;
@@ -529,12 +514,38 @@ sub start_mcp_server {
 				emit_json_line($response) if $response;
 			}
 		}
+		# Monitor bridge I/O
 		foreach my $vm_name (keys %bridges) {
 			my $bridge = $bridges{$vm_name};
 			next unless $bridge && $bridge->{select};
 			my @bridge_ready = $bridge->{select}->can_read(0.01);
 			for my $fh (@bridge_ready) {
 				monitor_bridge($vm_name, $fh);
+			}
+		}
+		# Send periodic progress notifications ONLY to clients that have explicitly subscribed
+		if (keys %progress_subscriptions && time() - $last_progress_time >= 0.5) {
+			$last_progress_time = time();
+			foreach my $progressToken (keys %progress_subscriptions) {
+				my $sub = $progress_subscriptions{$progressToken};
+				my $vm_name = $sub->{vm_name};
+				my $bridge = $bridges{$vm_name};
+				# Only send if bridge exists and has content
+				if ($bridge && @{ $bridge->{buffer} }) {
+					my $raw_bytes = join('', map { $$_ } @{ $bridge->{buffer} });
+					my $text;
+					eval { $text = decode_utf8($raw_bytes, 1); 1 } or do {
+						$text = $raw_bytes;
+						$text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge;
+						};
+					send_progress_notification($progressToken, undef, undef, $text);
+					$sub->{last_sent} = time();
+				}
+				# Clean up stale subscriptions (no bridge, or bridge stopped)
+				unless ($bridge) {
+					debug("Cleaning up progress subscription for $vm_name (bridge gone)");
+					delete $progress_subscriptions{$progressToken};
+				}
 			}
 		}
 		flush_write_buffers() if %write_buffers;
@@ -623,7 +634,7 @@ sub handle_request {
 	# --- notifications/initialized (client notification, no response) ---
 	if ($method eq 'notifications/initialized') {
 		debug("Client initialized notification received");
-		return;  # no response for notifications
+		return;
 	}
 	# --- ping ---
 	if ($method eq 'ping') {
@@ -825,7 +836,16 @@ sub tool_start {
 		debug("Stopping existing bridge for VM: $vm_name (fresh slate)");
 		$old_term_pid = stop_bridge($vm_name, 0);
 	}
-	return start_bridge($vm_name, $port, $progressToken, $old_term_pid);
+	my $result = start_bridge($vm_name, $port, $progressToken, $old_term_pid);
+	# Register progress subscription if token provided
+	if ($progressToken && ref($result) eq 'HASH' && $result->{success}) {
+		$progress_subscriptions{$progressToken} = {
+			vm_name => $vm_name,
+			last_sent => time(),
+			};
+		debug("Progress subscription registered for token: $progressToken (VM: $vm_name)");
+	}
+	return $result;
 }
 sub tool_stop {
 	my ($params) = @_;
@@ -838,8 +858,14 @@ sub tool_stop {
 	}
 	# Clean up resource subscription for this VM
 	delete $resource_subscriptions{"vm://$vm_name/output"};
+	# Clean up progress subscriptions for this VM
+	foreach my $token (keys %progress_subscriptions) {
+		if ($progress_subscriptions{$token}{vm_name} eq $vm_name) {
+			delete $progress_subscriptions{$token};
+			debug("Cleaned up progress subscription for VM: $vm_name (token: $token)");
+		}
+	}
 	stop_bridge($vm_name, 1);
-	# Notify that resource list changed
 	send_resource_list_changed_notification();
 	return { success => 1, message => "Bridge stopped for VM: $vm_name" };
 }
@@ -966,8 +992,9 @@ sub start_bridge {
 		return tool_exec_error("Failed to create communication pipe for VM: $vm_name: $!");
 	}
 	send_progress_notification($progressToken, 1, 5, "Creating Unix sockets") if $progressToken;
-	my $socket_in_path  = "/tmp/serial_${vm_name}.in";
-	my $socket_out_path = "/tmp/serial_${vm_name}.out";
+	my $session_id = sprintf("%s_%d", $vm_name, time());
+	my $socket_in_path  = "/tmp/serial_${session_id}.in";
+	my $socket_out_path = "/tmp/serial_${session_id}.out";
 	remove_socket_file($socket_in_path,  "bridge setup");
 	remove_socket_file($socket_out_path, "bridge setup");
 	my $socket_in  = IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => $socket_in_path, Listen => 8);
@@ -985,7 +1012,6 @@ sub start_bridge {
 	set_nonblocking($socket_in);
 	set_nonblocking($socket_out);
 	send_progress_notification($progressToken, 2, 5, "Forking bridge process") if $progressToken;
-	# Get slave TTY names before fork so child can reopen them
 	my $slave_in_name  = $pty_in->ttyname();
 	my $slave_out_name = $pty_out->ttyname();
 	my $pid = fork();
@@ -1007,16 +1033,12 @@ sub start_bridge {
 	if ($pid == 0) {
 		$IS_PARENT = 0;
 		close($read_pipe);
-		# Close master-side references to sockets (child doesn't need them)
 		$socket_in->close();
 		$socket_out->close();
-		# Open slave PTYs properly in child context
 		my $pty_in_slave  = $pty_in->slave();
 		my $pty_out_slave = $pty_out->slave();
-		# Close master sides in child
 		$pty_in->close();
 		$pty_out->close();
-		# Configure slave terminals
 		my $termios = POSIX::Termios->new();
 		for my $slave ($pty_in_slave, $pty_out_slave) {
 			my $fd = fileno($slave);
@@ -1055,7 +1077,6 @@ sub start_bridge {
 			exit(1);
 		}
 	}
-	# Parent continues here
 	close($write_pipe);
 	send_progress_notification($progressToken, 3, 5, "Waiting for VM connection") if $progressToken;
 	my $select = IO::Select->new($read_pipe);
@@ -1091,7 +1112,6 @@ sub start_bridge {
 	close($read_pipe);
 	if ($ready) {
 		send_progress_notification($progressToken, 4, 5, "Setting up terminal") if $progressToken;
-		my $session_id = sprintf("session_%s_%d", $vm_name, time());
 		push @created_socket_files, ($socket_in_path, $socket_out_path);
 		$bridges{$vm_name} = {
 			pty_in               => $pty_in,
@@ -1105,6 +1125,9 @@ sub start_bridge {
 			pid                  => $pid,
 			terminal_pid         => $old_term_pid,
 			restarting           => 0,
+			socket_in_path       => $socket_in_path,
+			socket_out_path      => $socket_out_path,
+			session_id           => $session_id,
 			session              => { id => $session_id, clients => {}, input_clients => {} },
 			select               => IO::Select->new($pty_out, $socket_in, $socket_out),
 			};
@@ -1117,7 +1140,6 @@ sub start_bridge {
 			$term_pid = spawn_terminal_client($vm_name, $socket_in_path, $socket_out_path);
 			$bridges{$vm_name}{terminal_pid} = $term_pid if exists $bridges{$vm_name};
 		}
-		# Notify that resource list changed (new VM resource available)
 		send_resource_list_changed_notification();
 		send_progress_notification($progressToken, 5, 5, "Bridge ready") if $progressToken;
 		return {
@@ -1155,8 +1177,6 @@ sub bridge_process_child {
 		my @ready = $select->can_read(0.05);
 		for my $fh (@ready) {
 			if ($fh == $vm_socket) {
-				# VM sent data -> write to output PTY slave
-				# Parent reads from output PTY master
 				my $buffer;
 				my $bytes = sysread($vm_socket, $buffer, 4096);
 				if (!defined $bytes) {
@@ -1167,8 +1187,6 @@ sub bridge_process_child {
 					debug("Bridge child: VM socket closed");
 					goto CHILD_EXIT;
 				} else {
-					# Write to the slave side of pty_out
-					# This makes data readable on the master side (pty_out in parent)
 					my $offset = 0;
 					while ($offset < length($buffer)) {
 						my $written = syswrite($pty_out_slave, $buffer, length($buffer) - $offset, $offset);
@@ -1183,8 +1201,6 @@ sub bridge_process_child {
 					}
 				}
 			} elsif ($fh == $pty_in_slave) {
-				# Parent wrote to pty_in master -> readable on pty_in slave
-				# Forward to VM
 				my $buffer;
 				my $bytes = sysread($pty_in_slave, $buffer, 4096);
 				if (!defined $bytes) {
@@ -1203,7 +1219,6 @@ sub bridge_process_child {
 				}
 			}
 		}
-		# Check if VM socket is still connected
 		unless ($vm_socket->connected()) {
 			debug("Bridge child: VM socket disconnected");
 			last;
@@ -1270,8 +1285,14 @@ sub stop_bridge {
 	$bridge->{pty_out}->close()    if $bridge->{pty_out};
 	$bridge->{socket_in}->close()  if $bridge->{socket_in};
 	$bridge->{socket_out}->close() if $bridge->{socket_out};
-	remove_socket_file("/tmp/serial_${vm_name}.in",  "bridge cleanup");
-	remove_socket_file("/tmp/serial_${vm_name}.out", "bridge cleanup");
+	my $s_in = $bridge->{socket_in_path};
+	my $s_out = $bridge->{socket_out_path};
+	remove_socket_file($s_in, "bridge cleanup ($vm_name)") if $s_in;
+	remove_socket_file($s_out, "bridge cleanup ($vm_name)") if $s_out;
+	my @socks = glob("/tmp/serial_${vm_name}_*.in /tmp/serial_${vm_name}_*.out");
+	for my $s (@socks) {
+		remove_socket_file($s, "bridge cleanup safety ($vm_name)");
+	}
 	delete $bridges{$vm_name};
 	delete $restart_guard{$vm_name};
 	delete $restart_backoff{$vm_name};
@@ -1313,8 +1334,17 @@ sub monitor_bridge {
 		my $bytes = sysread($bridge->{pty_out}, $buffer, 4096);
 		if (defined $bytes && $bytes > 0) {
 			debug("Monitor: Read $bytes bytes from VM via output PTY");
-			# Buffer the output and send resource updated notification
-			buffer_vm_output($vm_name, $buffer);
+			push @{ $bridge->{buffer} }, \$buffer;
+			$bridge->{buffer_bytes} += length($buffer);
+			$bridge->{total_bytes_received} += length($buffer);
+			while (@{ $bridge->{buffer} } > $RING_BUFFER_SIZE ||
+				$bridge->{buffer_bytes} > $MAX_BUFFER_BYTES) {
+				my $removed_ref = shift @{ $bridge->{buffer} };
+				$bridge->{buffer_bytes} -= length($$removed_ref) if defined $removed_ref;
+			}
+			# Send resource updated notification for subscribed clients
+			my $uri = "vm://$vm_name/output";
+			send_resource_updated_notification($uri);
 			# Forward to all connected terminal socket clients
 			for my $cid (keys %{ $bridge->{session}{clients} }) {
 				my $client = $bridge->{session}{clients}{$cid};
@@ -1347,7 +1377,6 @@ sub monitor_bridge {
 			$bridge->{session}{clients}{$client_id} = $client;
 			$bridge->{select}->add($client);
 			debug("New output client $client_id connected");
-			# Send buffered history to newly connected terminal
 			if (@{ $bridge->{buffer} }) {
 				my $start = @{ $bridge->{buffer} } > $CONSOLE_HISTORY_LINES
 					? @{ $bridge->{buffer} } - $CONSOLE_HISTORY_LINES
@@ -1460,6 +1489,7 @@ sub cleanup {
 		$remove_with_retry->($path);
 	}
 	%resource_subscriptions = ();
+	%progress_subscriptions = ();
 	debug("Cleanup completed");
 }
 sub spawn_terminal_client {
@@ -1522,7 +1552,6 @@ sub run_unix_socket_client {
 	my $socket_out_path = $socket_path;
 	my $socket_in_path  = $socket_out_path;
 	$socket_in_path =~ s/\.out$/.in/;
-	# Restore terminal to cooked mode for proper display
 	my $old_termios;
 	if (-t STDIN) {
 		$old_termios = POSIX::Termios->new();
@@ -1530,33 +1559,40 @@ sub run_unix_socket_client {
 		my $new_termios = POSIX::Termios->new();
 		$new_termios->getattr(fileno(STDIN));
 		my $lflag = $new_termios->getlflag();
-		# Keep terminal in raw-ish mode for input but ensure output works
 		$lflag &= ~(ICANON | ECHO);
 		$new_termios->setlflag($lflag);
 		$new_termios->setattr(fileno(STDIN), TCSANOW);
 	}
-	# Ensure STDOUT is unbuffered
 	select(STDOUT);
 	$| = 1;
 	my $base_delay  = 0.5;
 	my $max_delay   = 16;
 	my $retry_count = 0;
+	my $first_fail_time = 0;
 	while (1) {
 		my $delay = $base_delay * (2 ** $retry_count);
 		$delay = $max_delay if $delay > $max_delay;
 		my $sock_in  = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $socket_in_path);
 		my $sock_out = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $socket_out_path);
 		unless (defined $sock_in && defined $sock_out) {
-			print STDERR "Cannot connect to sockets (attempt $retry_count). Retrying in ${delay}s...\n";
+			if ($first_fail_time == 0) {
+				$first_fail_time = time();
+			}
+			my $elapsed = time() - $first_fail_time;
+			if ($CONSOLE_KILL_TIMEOUT > 0 && $elapsed >= $CONSOLE_KILL_TIMEOUT) {
+				print STDERR "Cannot connect to bridge after ${elapsed}s. Closing terminal.\n";
+				exit(0);
+			}
+			print STDERR "Cannot connect to sockets (attempt $retry_count, ${elapsed}s/${CONSOLE_KILL_TIMEOUT}s). Retrying in ${delay}s...\n";
 			$retry_count++;
 			sleep $delay;
 			next;
 		}
 		$retry_count = 0;
+		$first_fail_time = 0;
 		binmode(STDOUT, ':raw');
 		set_nonblocking(\*STDIN);
 		set_nonblocking($sock_out);
-		# Do NOT set STDOUT nonblocking - we want writes to block rather than drop data
 		my $sel = IO::Select->new(\*STDIN, $sock_out);
 		my $connected = 1;
 		while ($connected) {
@@ -1575,7 +1611,6 @@ sub run_unix_socket_client {
 					last;
 				}
 				if ($fh == \*STDIN) {
-					# User typed something -> send to VM via input socket
 					my $written = syswrite($sock_in, $buf, length($buf));
 					unless (defined $written && $written > 0) {
 						unless ($!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK}) {
@@ -1585,8 +1620,6 @@ sub run_unix_socket_client {
 						}
 					}
 				} else {
-					# VM output arrived -> display in terminal
-					# Use blocking write to ensure all data is displayed
 					my $offset = 0;
 					while ($offset < length($buf)) {
 						my $written = syswrite(STDOUT, $buf, length($buf) - $offset, $offset);
@@ -1606,7 +1639,6 @@ sub run_unix_socket_client {
 		$sock_in->close();
 		$sock_out->close();
 	}
-	# Restore terminal settings on exit
 	if ($old_termios) {
 		$old_termios->setattr(fileno(STDIN), TCSANOW);
 	}
