@@ -370,7 +370,7 @@ sub close_http_client {
 	return unless defined $fd && exists $http_conns{$fd};
 	my $conn = delete $http_conns{$fd};
 	my $sid  = $conn->{session_id};
-	if (defined $sid && exists $sessions{$sid} && $sessions{$sid}{stream_fd} == $fd) {
+	if (defined $sid && exists $sessions{$sid} && defined $sessions{$sid}{stream_fd} && $sessions{$sid}{stream_fd} == $fd) {
 		$sessions{$sid}{stream_fd} = undef;
 	}
 	eval { $main_select->remove($conn->{sock}) };
