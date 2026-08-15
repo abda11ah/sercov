@@ -103,6 +103,28 @@ You can also specify a terminal explicitly:
 }
 ```
 
+### HTTP Experimental Server (`http_experimental.pl`)
+
+`http_experimental.pl` is an experimental **Streamable HTTP** MCP server (v2.0) exposing the same 5 tools (`start`, `stop`, `status`, `read`, `write`) over HTTP instead of stdio. It listens by default on `http://127.0.0.1:8080/mcp`, uses Server-Sent Events (SSE) to stream live VM output notifications (but still need 'read' tool to get after each call to 'write' tool (current limitation, needs more investigation)), and supports session-based resource subscriptions with CORS enabled. Launch it with:
+
+```bash
+./http_experimental.pl &
+```
+
+Then register it as a **remote** MCP server:
+
+Opencode example (`~/.opencode/opencode.jsonc`)
+
+```json
+"mcp": {
+    "serencp": {
+        "type": "remote",
+        "url": "http://127.0.0.1:8080/mcp",
+        "enabled": true
+    }
+}
+```
+
 **Make sure your guest OS is configured to use the serial console.**
 
 GRUB example:

@@ -489,9 +489,12 @@ sub validate_streamable_http_headers {
 	my ($headers) = @_;
 	my $proto_ver = $headers->{'mcp-protocol-version'};
 	my $origin    = $headers->{'origin'};
-	if (defined $proto_ver && $proto_ver ne $PROTOCOL_VERSION && $proto_ver ne '2025-03-26') {
-		return (0, 400, "Unsupported MCP-Protocol-Version");
+=pod
+    # Temporarly disabled protocol version check
+	if (defined $proto_ver && $proto_ver ne $PROTOCOL_VERSION) {
+		return (0, 400, "Unsupported MCP-Protocol-Version $proto_ver");
 	}
+=cut
 	if (defined $origin && $origin !~ m{^https?://(127\.0\.0\.1|localhost)(:\d+)?$}) {
 		return (0, 403, "Invalid Origin (DNS rebinding protection)");
 	}
